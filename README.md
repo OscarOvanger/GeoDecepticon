@@ -1,3 +1,3 @@
 # GeoDecepticon
-![Moohaha](deception.jpeg)
+![Moohaha](decepticon.jpeg)
 - This is the repository for Geo-ViT.
