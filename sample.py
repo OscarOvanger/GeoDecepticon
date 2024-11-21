@@ -3,9 +3,9 @@ from transformer import VisionTransformer
 from dataloader import preprocess_image
 
 # Load model
-model = VisionTransformer(embed_dim=4, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=16, max_patches=1024)
-model.load_state_dict(torch.load("vision_transformer.pth"))
-model.eval()
+#model = VisionTransformer(embed_dim=4, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=16, max_patches=1024)
+#model.load_state_dict(torch.load("vision_transformer.pth"))
+#model.eval()
 
 def sample(image, model, device):
     patch_indices = preprocess_image(image).to(device)
