@@ -55,17 +55,17 @@ class VisionTransformer(nn.Module):
 
     def forward(self, patches, mask):
         # Debugging shapes
-        print(f"Patches shape: {patches.shape}")  # Should be [batch_size, num_patches]
+        #print(f"Patches shape: {patches.shape}")  # Should be [batch_size, num_patches]
 
         # Retrieve embeddings
         embeddings = self.embedding_matrix(patches)  # (batch_size, num_patches, embed_dim)
-        print(f"Embeddings shape before masking: {embeddings.shape}")
+        #print(f"Embeddings shape before masking: {embeddings.shape}")
 
         # Ensure mask matches the embeddings' shape
-        print(f"Mask shape: {mask.shape}")  # Should match patches.shape
+        #print(f"Mask shape: {mask.shape}")  # Should match patches.shape
         embeddings[mask.bool()] = self.embedding_matrix.weight[-1]  # Apply mask token embedding
 
-        print(f"Embeddings shape after masking: {embeddings.shape}")
+        #print(f"Embeddings shape after masking: {embeddings.shape}")
 
         # Transformer encoder layers
         x = embeddings.permute(1, 0, 2)  # Shape: (seq_len, batch_size, embed_dim)
@@ -75,7 +75,7 @@ class VisionTransformer(nn.Module):
 
         # Output logits
         logits = self.fc_out(x)  # Shape: (batch_size, seq_len, num_tokens)
-        print(f"Logits shape: {logits.shape}")
+        #print(f"Logits shape: {logits.shape}")
         return logits
 
     def get_probabilities(self, logits):
