@@ -149,7 +149,7 @@ class TransformerEncoderLayer(nn.Module):
         seq_len, batch_size, embed_dim = x.size()
 
         # Compute queries, keys, and values manually for relative positional embeddings
-        q = k = v = x.view(seq_len, batch_size * self.num_heads, self.head_dim).permute(1, 0, 2)  # (batch_size*num_heads, seq_len, head_dim)
+        q = k = v = x.contiguous().view(seq_len, batch_size * self.num_heads, self.head_dim).permute(1, 0, 2)
 
         # Compute scaled dot-product attention scores
         attention_scores = torch.einsum("bqd,bkd->bqk", q, k)  # (batch_size*num_heads, seq_len, seq_len)
