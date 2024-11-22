@@ -31,9 +31,9 @@ class VisionTransformer(nn.Module):
         )
         
         # Learnable positional embeddings
-        #self.positional_embeddings = nn.Parameter(
-        #    torch.randn(1, max_patches, embed_dim)  # Shape: (1, num_patches, embed_dim)
-        #)
+        self.positional_embeddings = nn.Parameter(
+            torch.randn(1, max_patches, embed_dim)  # Shape: (1, num_patches, embed_dim)
+        )
 
         # Transformer encoder layers
         self.encoder_layers = nn.ModuleList([
@@ -46,52 +46,31 @@ class VisionTransformer(nn.Module):
 
     def forward(self, patches, mask):
         # Retrieve embeddings
-        # This is the input to the transformer
-        embeddings = self.embedding_matrix(patches)  # (batch_size, num_patches, embed_dim)
-
+        embeddings = self.embedding_matrix(patches)
+    
         # Replace masked patches with mask token embedding
         mask_token_embedding = self.embedding_matrix.weight[-1]
         embeddings[mask.bool()] = mask_token_embedding
-
+    
         # Add positional embeddings
-        # We add positional embeddings to the Inputs
-        #embeddings = embeddings + self.positional_embeddings  # Add positional info
-
-        # Transformer encoder layers
+        embeddings = embeddings + self.positional_embeddings
+    
+        # Prepare input for transformer layers
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
+    
+        # Pass through transformer layers with mask
         for layer in self.encoder_layers:
-            x = layer(x)
-        x = x.permute(1, 0, 2)  # Back to (batch_size, seq_len, embed_dim)
-
+            x = layer(x, mask)
+    
         # Output logits
-        # This is x[i,j,:]*W_vocab + b_bias, it is logits that can later be taken softmax of in the crossentropy loss.
+        x = x.permute(1, 0, 2)  # Back to (batch_size, seq_len, embed_dim)
         logits = self.fc_out(x)  # (batch_size, seq_len, num_tokens)
         return logits
 
     def get_probabilities(self, logits):
         """Compute probabilities using softmax."""
         return torch.softmax(logits, dim=-1)
-"""
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
-        self.feedforward = nn.Sequential(
-            nn.Linear(embed_dim, feedforward_dim),
-            nn.ReLU(),
-            nn.Linear(feedforward_dim, embed_dim),
-            nn.Dropout(dropout)
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):
-        attn_output, _ = self.attention(x, x, x)
-        x = self.norm1(x + attn_output)
-        feedforward_output = self.feedforward(x)
-        x = self.norm2(x + feedforward_output)
-        return x
-"""
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, max_relative_positions=32):
         super().__init__()
@@ -116,71 +95,58 @@ class TransformerEncoderLayer(nn.Module):
         self.relative_position_embeddings = nn.Parameter(
             torch.randn((2 * max_relative_positions - 1), embed_dim // num_heads)
         )
-
+        
+    def add_relative_position_scores(self, attention_scores, seq_len):
+        """
+        Add relative positional embeddings to the attention scores.
+        Args:
+            attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
+            seq_len (int): Length of the sequence.
+    
+        Returns:
+            Tensor: Updated attention scores with relative positional embeddings.
+        """
+        # Compute relative positions
+        relative_positions = self.compute_relative_positions(seq_len)  # (seq_len, seq_len)
+    
+        # Retrieve corresponding relative positional embeddings
+        relative_position_scores = self.relative_position_embeddings[relative_positions]  # (seq_len, seq_len, head_dim)
+    
+        # Reshape and expand to match attention scores shape
+        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # (head_dim, seq_len, seq_len)
+        relative_position_scores = relative_position_scores.unsqueeze(0).repeat(self.num_heads, 1, 1, 1)  # (num_heads, head_dim, seq_len, seq_len)
+    
+        # Combine with attention scores
+        attention_scores = attention_scores + relative_position_scores.sum(dim=1)  # Sum over head_dim
+    return attention_scores
     def compute_relative_positions(self, seq_len):
-        # Create a relative position matrix
         range_vec = torch.arange(seq_len)
-        relative_positions = range_vec[:, None] - range_vec[None, :]  # Shape: (seq_len, seq_len)
+        relative_positions = range_vec[:, None] - range_vec[None, :]  # (seq_len, seq_len)
         relative_positions = relative_positions + self.max_relative_positions - 1
-        relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)  # Keep within bounds
+        relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)
         return relative_positions
 
-    def add_relative_position_scores(self, attention_scores, seq_len):
-        # Compute relative position embeddings
-        relative_positions = self.compute_relative_positions(seq_len)
-        relative_position_scores = self.relative_position_embeddings[relative_positions]  # (seq_len, seq_len, head_dim)
-
-        # Add relative position scores to the attention scores
-        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # (head_dim, seq_len, seq_len)
-        attention_scores = attention_scores + relative_position_scores  # Add to attention scores
-        return attention_scores
-
-    def forward(self, x):
+    def forward(self, x, mask=None):
         seq_len, batch_size, embed_dim = x.size()
 
-        # Multi-head attention with relative position embeddings
-        attn_output, _ = self.attention(x, x, x)  # Standard attention
-        attn_output = self.add_relative_position_scores(attn_output, seq_len)  # Add relative position scores
+        # Create key padding mask
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = ~mask.bool()  # Invert mask
 
-        # Residual connection and normalization
-        x = self.norm1(x + attn_output)
+        # Multi-head attention
+        q, k, v = x, x, x
+        attn_scores = self.attention(q, k, v, key_padding_mask=key_padding_mask)[0]
 
-        # Feedforward
+        # Add relative positional embeddings to scores
+        attn_scores = self.add_relative_position_scores(attn_scores, seq_len)
+
+        # Apply residual connection and normalization
+        x = self.norm1(x + attn_scores)
+
+        # Feedforward layer
         feedforward_output = self.feedforward(x)
         x = self.norm2(x + feedforward_output)
 
         return x
     
-
-# Test the Vision Transformer
-def test_transformer():
-    print("Testing Vision Transformer...")
-
-    # Define dummy input
-    batch_size = 2
-    num_patches = 32 * 32  # For 64x64 image with 2x2 patches
-    embed_dim = 4
-    num_tokens = 16
-    masked_token_index = num_tokens  # Mask token index
-
-    # Create dummy input data
-    input_patches = torch.randint(0, num_tokens, (batch_size, num_patches))
-    mask = torch.zeros_like(input_patches, dtype=torch.bool)
-    mask[:, :100] = 1  # Mask the first 100 patches
-
-    # Initialize the model
-    model = VisionTransformer(embed_dim, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=num_tokens, max_patches=num_patches)
-
-    # Forward pass
-    logits = model(input_patches, mask)
-    print("logits:", logits)
-    assert logits.shape == (batch_size, num_patches, num_tokens), "Logits shape is incorrect"
-    print("Logits shape test passed.")
-
-    # Check probabilities
-    probabilities = model.get_probabilities(logits)
-    print("probabilities:", probabilities)
-    assert torch.allclose(probabilities.sum(dim=-1), torch.ones_like(probabilities.sum(dim=-1)), atol=1e-5), "Probabilities do not sum to 1"
-    print("Softmax probabilities test passed.")
-
-#test_transformer()
