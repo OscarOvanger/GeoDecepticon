@@ -118,7 +118,7 @@ class TransformerEncoderLayer(nn.Module):
     
         # Combine with attention scores
         attention_scores = attention_scores + relative_position_scores.sum(dim=1)  # Sum over head_dim
-    return attention_scores
+        return attention_scores
     def compute_relative_positions(self, seq_len):
         range_vec = torch.arange(seq_len)
         relative_positions = range_vec[:, None] - range_vec[None, :]  # (seq_len, seq_len)
