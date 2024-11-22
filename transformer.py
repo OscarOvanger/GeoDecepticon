@@ -110,7 +110,7 @@ class TransformerEncoderLayer(nn.Module):
         # Retrieve corresponding relative positional embeddings
         relative_position_scores = self.relative_position_embeddings[relative_positions]  # (seq_len, seq_len, head_dim)
 
-        # Expand dimensions to align with attention scores
+        # Expand dimensions to align with attention scores shape
         relative_position_scores = relative_position_scores.permute(2, 0, 1).unsqueeze(0)  # (1, head_dim, seq_len, seq_len)
         relative_position_scores = relative_position_scores.repeat(self.num_heads, 1, 1, 1)  # (num_heads, head_dim, seq_len, seq_len)
 
@@ -121,8 +121,16 @@ class TransformerEncoderLayer(nn.Module):
     def forward(self, x, mask=None):
         seq_len, batch_size, embed_dim = x.size()
 
-        # Compute queries, keys, and values manually for access to attention scores
-        q = k = v = x.view(seq_len, batch_size * self.num_heads, self.head_dim)  # Split into heads
+        # Ensure input is contiguous for reshaping
+        x = x.contiguous()
+
+        # Create key padding mask
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = ~mask.bool()  # Invert mask
+
+        # Multi-head attention
+        q = k = v = x.reshape(seq_len, batch_size * self.num_heads, self.head_dim)  # Split into heads
 
         # Compute scaled dot-product attention scores
         attention_scores = torch.einsum("ibhd,jbhd->ijbh", q, k) / (self.head_dim ** 0.5)  # Shape: (seq_len, seq_len, num_heads)
@@ -135,7 +143,7 @@ class TransformerEncoderLayer(nn.Module):
 
         # Apply attention
         attention_output = torch.einsum("ijbh,jbhd->ibhd", attention_probs, v)  # Shape: (seq_len, batch_size * num_heads, head_dim)
-        attention_output = attention_output.contiguous().view(seq_len, batch_size, embed_dim)
+        attention_output = attention_output.contiguous().reshape(seq_len, batch_size, embed_dim)
 
         # Residual connection and normalization
         x = self.norm1(x + attention_output)
