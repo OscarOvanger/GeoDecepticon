@@ -96,22 +96,34 @@ class TransformerEncoderLayer(nn.Module):
         return relative_positions
 
     def add_relative_position_scores(self, attention_scores, seq_len):
+    """
+    Add relative positional embeddings to the attention scores.
+
+    Args:
+        attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
+        seq_len (int): Length of the sequence.
+
+    Returns:
+        Tensor: Updated attention scores with relative positional embeddings.
+    """
         # Compute relative positions
-        relative_positions = self.compute_relative_positions(seq_len)
-
-        # Retrieve relative positional embeddings
-        relative_position_scores = self.relative_position_embeddings[relative_positions]
-
-        # Expand and reshape to match attention_scores
-        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # (head_dim, seq_len, seq_len)
+        relative_positions = self.compute_relative_positions(seq_len)  # Shape: (seq_len, seq_len)
+    
+        # Retrieve corresponding relative positional embeddings
+        relative_position_scores = self.relative_position_embeddings[relative_positions]  # Shape: (seq_len, seq_len, head_dim)
+    
+        # Expand and reshape to match attention scores
+        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # Shape: (head_dim, seq_len, seq_len)
         relative_position_scores = relative_position_scores.unsqueeze(0).expand(
             self.num_heads, -1, -1, -1
-        )  # (num_heads, head_dim, seq_len, seq_len)
-        relative_position_scores = relative_position_scores.sum(dim=1)  # (num_heads, seq_len, seq_len)
+        )  # Shape: (num_heads, head_dim, seq_len, seq_len)
+        relative_position_scores = relative_position_scores.sum(dim=1)  # Sum over head_dim: (num_heads, seq_len, seq_len)
+    
+        # Expand to match attention_scores (batch_size * num_heads, seq_len, seq_len)
         relative_position_scores = relative_position_scores.repeat_interleave(
             attention_scores.size(0) // self.num_heads, dim=0
-        )  # (batch_size * num_heads, seq_len, seq_len)
-
+        )  # Shape: (batch_size * num_heads, seq_len, seq_len)
+    
         # Add relative positional scores
         attention_scores = attention_scores + relative_position_scores
         return attention_scores
