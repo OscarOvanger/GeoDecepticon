@@ -23,16 +23,9 @@ class VisionTransformer(nn.Module):
         # Set the last row to all 2s for the masked patch
         embedding_matrix[-1, :] = 2  # Mask token embedding
 
-
         # Create embedding layer
-        # We create the embedding layer with freeze = True, because we fix it in this case.
         self.embedding_matrix = nn.Embedding.from_pretrained(
             embedding_matrix, freeze=True
-        )
-        
-        # Learnable positional embeddings
-        self.positional_embeddings = nn.Parameter(
-            torch.randn(1, max_patches, embed_dim)  # Shape: (1, num_patches, embed_dim)
         )
 
         # Transformer encoder layers
@@ -47,21 +40,18 @@ class VisionTransformer(nn.Module):
     def forward(self, patches, mask):
         # Retrieve embeddings
         embeddings = self.embedding_matrix(patches)
-    
+
         # Replace masked patches with mask token embedding
         mask_token_embedding = self.embedding_matrix.weight[-1]
         embeddings[mask.bool()] = mask_token_embedding
-    
-        # Add positional embeddings
-        embeddings = embeddings + self.positional_embeddings
-    
+
         # Prepare input for transformer layers
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
-    
+
         # Pass through transformer layers with mask
         for layer in self.encoder_layers:
             x = layer(x, mask)
-    
+
         # Output logits
         x = x.permute(1, 0, 2)  # Back to (batch_size, seq_len, embed_dim)
         logits = self.fc_out(x)  # (batch_size, seq_len, num_tokens)
@@ -71,15 +61,16 @@ class VisionTransformer(nn.Module):
         """Compute probabilities using softmax."""
         return torch.softmax(logits, dim=-1)
 
+
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, max_relative_positions=32):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
         self.max_relative_positions = max_relative_positions
 
         # Attention and feedforward layers
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
         self.feedforward = nn.Sequential(
             nn.Linear(embed_dim, feedforward_dim),
             nn.ReLU(),
@@ -93,32 +84,9 @@ class TransformerEncoderLayer(nn.Module):
 
         # Relative positional embeddings
         self.relative_position_embeddings = nn.Parameter(
-            torch.randn((2 * max_relative_positions - 1), embed_dim // num_heads)
+            torch.randn((2 * max_relative_positions - 1), self.head_dim)
         )
-        
-    def add_relative_position_scores(self, attention_scores, seq_len):
-        """
-        Add relative positional embeddings to the attention scores.
-        Args:
-            attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
-            seq_len (int): Length of the sequence.
-    
-        Returns:
-            Tensor: Updated attention scores with relative positional embeddings.
-        """
-        # Compute relative positions
-        relative_positions = self.compute_relative_positions(seq_len)  # (seq_len, seq_len)
-    
-        # Retrieve corresponding relative positional embeddings
-        relative_position_scores = self.relative_position_embeddings[relative_positions]  # (seq_len, seq_len, head_dim)
-    
-        # Reshape and expand to match attention scores shape
-        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # (head_dim, seq_len, seq_len)
-        relative_position_scores = relative_position_scores.unsqueeze(0).repeat(self.num_heads, 1, 1, 1)  # (num_heads, head_dim, seq_len, seq_len)
-    
-        # Combine with attention scores
-        attention_scores = attention_scores + relative_position_scores.sum(dim=1)  # Sum over head_dim
-        return attention_scores
+
     def compute_relative_positions(self, seq_len):
         range_vec = torch.arange(seq_len)
         relative_positions = range_vec[:, None] - range_vec[None, :]  # (seq_len, seq_len)
@@ -126,27 +94,54 @@ class TransformerEncoderLayer(nn.Module):
         relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)
         return relative_positions
 
+    def add_relative_position_scores(self, attention_scores, seq_len):
+        """
+        Add relative positional embeddings to the attention scores.
+        Args:
+            attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
+            seq_len (int): Length of the sequence.
+
+        Returns:
+            Tensor: Updated attention scores with relative positional embeddings.
+        """
+        # Compute relative positions
+        relative_positions = self.compute_relative_positions(seq_len)  # (seq_len, seq_len)
+
+        # Retrieve corresponding relative positional embeddings
+        relative_position_scores = self.relative_position_embeddings[relative_positions]  # (seq_len, seq_len, head_dim)
+
+        # Expand dimensions to align with attention scores
+        relative_position_scores = relative_position_scores.permute(2, 0, 1).unsqueeze(0)  # (1, head_dim, seq_len, seq_len)
+        relative_position_scores = relative_position_scores.repeat(self.num_heads, 1, 1, 1)  # (num_heads, head_dim, seq_len, seq_len)
+
+        # Sum over head dimension to match attention scores shape
+        attention_scores += relative_position_scores.sum(dim=1)  # (num_heads, seq_len, seq_len)
+        return attention_scores
+
     def forward(self, x, mask=None):
         seq_len, batch_size, embed_dim = x.size()
 
-        # Create key padding mask
-        key_padding_mask = None
-        if mask is not None:
-            key_padding_mask = ~mask.bool()  # Invert mask
+        # Compute queries, keys, and values manually for access to attention scores
+        q = k = v = x.view(seq_len, batch_size * self.num_heads, self.head_dim)  # Split into heads
 
-        # Multi-head attention
-        q, k, v = x, x, x
-        attn_scores = self.attention(q, k, v, key_padding_mask=key_padding_mask)[0]
+        # Compute scaled dot-product attention scores
+        attention_scores = torch.einsum("ibhd,jbhd->ijbh", q, k) / (self.head_dim ** 0.5)  # Shape: (seq_len, seq_len, num_heads)
 
         # Add relative positional embeddings to scores
-        attn_scores = self.add_relative_position_scores(attn_scores, seq_len)
+        attention_scores = self.add_relative_position_scores(attention_scores, seq_len)
 
-        # Apply residual connection and normalization
-        x = self.norm1(x + attn_scores)
+        # Apply softmax to get attention probabilities
+        attention_probs = torch.softmax(attention_scores, dim=-1)
+
+        # Apply attention
+        attention_output = torch.einsum("ijbh,jbhd->ibhd", attention_probs, v)  # Shape: (seq_len, batch_size * num_heads, head_dim)
+        attention_output = attention_output.contiguous().view(seq_len, batch_size, embed_dim)
+
+        # Residual connection and normalization
+        x = self.norm1(x + attention_output)
 
         # Feedforward layer
         feedforward_output = self.feedforward(x)
         x = self.norm2(x + feedforward_output)
 
         return x
-    
