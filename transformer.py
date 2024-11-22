@@ -4,8 +4,8 @@ import torch.nn as nn
 class VisionTransformer(nn.Module):
     def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.0):
         super().__init__()
-        # Define the embedding matrix (num_tokens = 16 + mask token)
-        embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Includes mask token
+        # Create the embedding matrix for all 2x2 binary combinations + 1 mask token
+        embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Shape: (num_tokens, embed_dim)
 
         # Generate all possible 2x2 binary patches
         patches = torch.tensor([
@@ -14,27 +14,15 @@ class VisionTransformer(nn.Module):
             for b in range(2)
             for c in range(2)
             for d in range(2)
-        ])
+        ])  # Shape: (16, 4) for 16 combinations of 2x2 patches
 
-        # Calculate the embeddings
+        # Assign each patch's values as its embedding
         for i, patch in enumerate(patches):
-            total_ones = patch.sum().item()
-            if total_ones == 0:
-                embedding_matrix[i] = torch.zeros(embed_dim)  # Handle zero patches
-                continue
+            embedding_matrix[i, :] = patch  # Set the embedding to the patch values
 
-            left_column = patch[::2].sum().item()
-            right_column = patch[1::2].sum().item()
-            lower_row = patch[2:].sum().item()
-            upper_row = patch[:2].sum().item()
+        # Set the last row to all 2s for the masked patch
+        embedding_matrix[-1, :] = 2  # Mask token embedding
 
-            embedding_matrix[i, 0] = left_column / total_ones
-            embedding_matrix[i, 1] = right_column / total_ones
-            embedding_matrix[i, 2] = lower_row / total_ones
-            embedding_matrix[i, 3] = upper_row / total_ones
-
-        # Assign a distinct embedding for the mask token
-        embedding_matrix[-1, :] = torch.ones(embed_dim)  # Mask token embedding
 
         # Create embedding layer
         # We create the embedding layer with freeze = True, because we fix it in this case.
