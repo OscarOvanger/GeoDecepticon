@@ -42,6 +42,7 @@ class VisionTransformer(nn.Module):
         embeddings = self.embedding_matrix(patches)
 
         # Replace masked patches with mask token embedding
+        # This step might actually not do anything, but makes sure that no funny business is going on
         mask_token_embedding = self.embedding_matrix.weight[-1]
         embeddings[mask.bool()] = mask_token_embedding
 
@@ -61,93 +62,133 @@ class VisionTransformer(nn.Module):
         """Compute probabilities using softmax."""
         return torch.softmax(logits, dim=-1)
 
+import torch.nn.functional as F
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, max_relative_positions=32):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.max_relative_positions = max_relative_positions
         self.head_dim = embed_dim // num_heads
+        self.max_relative_positions = max_relative_positions
 
-        # Attention and feedforward layers
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        # Ensure embed_dim is divisible by num_heads
+        assert (
+            self.embed_dim % self.num_heads == 0
+        ), "Embedding dimension must be divisible by the number of heads."
+
+        # Self-attention weights
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)  # For queries, keys, and values
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        # Feedforward network
         self.feedforward = nn.Sequential(
             nn.Linear(embed_dim, feedforward_dim),
             nn.ReLU(),
             nn.Linear(feedforward_dim, embed_dim),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
         # Layer normalization
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+
         # Relative positional embeddings
         self.relative_position_embeddings = nn.Parameter(
-            torch.randn((2 * max_relative_positions - 1), self.head_dim)
+            torch.randn(2 * max_relative_positions - 1, self.head_dim)
         )
 
     def compute_relative_positions(self, seq_len):
+        """
+        Compute the relative position matrix for a sequence of length `seq_len`.
+        """
         range_vec = torch.arange(seq_len)
-        relative_positions = range_vec[:, None] - range_vec[None, :]  # (seq_len, seq_len)
-        relative_positions = relative_positions + self.max_relative_positions - 1
-        relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)
+        relative_positions = range_vec[:, None] - range_vec[None, :]  # Shape: (seq_len, seq_len)
+        relative_positions += self.max_relative_positions - 1  # Shift to positive range
+        relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)  # Bound indices
         return relative_positions
 
     def add_relative_position_scores(self, attention_scores, seq_len):
         """
         Add relative positional embeddings to the attention scores.
-    
+
         Args:
-            attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
-            seq_len (int): Length of the sequence.
-    
-        Returns:
-            Tensor: Updated attention scores with relative positional embeddings.
+            attention_scores: Shape (batch_size, num_heads, seq_len, seq_len)
+            seq_len: Sequence length
         """
         # Compute relative positions
         relative_positions = self.compute_relative_positions(seq_len)  # Shape: (seq_len, seq_len)
-    
-        # Retrieve corresponding relative positional embeddings
+
+        # Retrieve relative positional embeddings
         relative_position_scores = self.relative_position_embeddings[relative_positions]  # Shape: (seq_len, seq_len, head_dim)
-    
-        # Expand and reshape to match attention scores
+
+        # Reshape to match attention_scores
         relative_position_scores = relative_position_scores.permute(2, 0, 1)  # Shape: (head_dim, seq_len, seq_len)
         relative_position_scores = relative_position_scores.unsqueeze(0).expand(
-            self.num_heads, -1, -1, -1
-        )  # Shape: (num_heads, head_dim, seq_len, seq_len)
-        relative_position_scores = relative_position_scores.sum(dim=1)  # Sum over head_dim: (num_heads, seq_len, seq_len)
-    
-        # Expand to match attention_scores (batch_size * num_heads, seq_len, seq_len)
-        relative_position_scores = relative_position_scores.repeat_interleave(
-            attention_scores.size(0) // self.num_heads, dim=0
-        )  # Shape: (batch_size * num_heads, seq_len, seq_len)
-    
-        # Add relative positional scores
-        attention_scores = attention_scores + relative_position_scores
+            attention_scores.size(0) // self.num_heads, -1, -1, -1
+        )  # Shape: (batch_size * num_heads, head_dim, seq_len, seq_len)
+
+        # Sum along the embedding dimension to align with attention_scores
+        relative_position_scores = relative_position_scores.sum(dim=1)  # Shape: (batch_size * num_heads, seq_len, seq_len)
+
+        # Add relative positional scores to attention scores
+        attention_scores += relative_position_scores
         return attention_scores
 
     def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input embeddings, shape (seq_len, batch_size, embed_dim)
+            mask: Optional mask, shape (batch_size, seq_len)
+        Returns:
+            Updated embeddings, shape (seq_len, batch_size, embed_dim)
+        """
         seq_len, batch_size, embed_dim = x.size()
 
-        # Create key padding mask
-        key_padding_mask = None
-        if mask is not None:
-            key_padding_mask = ~mask.bool()  # Invert mask
+        # Apply LayerNorm
+        x_norm = self.norm1(x)
 
-        # Multi-head attention
-        q, k, v = x, x, x
-        attention_scores = self.attention(q, k, v, key_padding_mask=key_padding_mask)[0]
+        # Compute Q, K, V
+        qkv = self.qkv_proj(x_norm).view(seq_len, batch_size, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)  # Shape: (seq_len, batch_size, num_heads, head_dim)
 
-        # Add relative positional embeddings to scores
+        # Transpose for multi-head attention compatibility
+        q = q.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
+        k = k.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
+        v = v.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
+
+        # Compute attention scores
+        attention_scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / (self.head_dim ** 0.5)  # (batch_size, num_heads, seq_len, seq_len)
+
+        # Add relative positional embeddings
         attention_scores = self.add_relative_position_scores(attention_scores, seq_len)
 
-        # Apply residual connection and normalization
-        x = self.norm1(x + attention_scores)
+        # Apply mask (optional)
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask[:, None, :, :], float("-inf"))
+
+        # Compute attention probabilities
+        attention_probs = F.softmax(attention_scores, dim=-1)  # (batch_size, num_heads, seq_len, seq_len)
+        attention_probs = self.dropout(attention_probs)
+
+        # Compute attention output
+        attention_output = torch.einsum("bhqk,bhkd->bhqd", attention_probs, v)  # (batch_size, num_heads, seq_len, head_dim)
+
+        # Concatenate heads
+        attention_output = attention_output.permute(2, 0, 1, 3).reshape(seq_len, batch_size, embed_dim)  # (seq_len, batch_size, embed_dim)
+
+        # Apply output projection
+        attention_output = self.out_proj(attention_output)
+
+        # Residual connection
+        x = x + self.dropout(attention_output)
 
         # Feedforward layer
-        feedforward_output = self.feedforward(x)
-        x = self.norm2(x + feedforward_output)
+        x_norm = self.norm2(x)
+        feedforward_output = self.feedforward(x_norm)
+        x = x + self.dropout(feedforward_output)
 
         return x
