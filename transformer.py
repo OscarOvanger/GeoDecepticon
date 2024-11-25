@@ -168,7 +168,8 @@ class TransformerEncoderLayer(nn.Module):
     
         # Apply mask (optional)
         if mask is not None:
-            attention_scores = attention_scores.masked_fill(mask[:, None, :, :], float("-inf"))
+            expanded_mask = mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, seq_len)
+            attention_scores = attention_scores.masked_fill(expanded_mask == 0, float("-inf"))
     
         # Compute attention probabilities
         attention_probs = F.softmax(attention_scores, dim=-1)  # (batch_size, num_heads, seq_len, seq_len)
