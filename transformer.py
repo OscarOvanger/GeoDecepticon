@@ -111,84 +111,84 @@ class TransformerEncoderLayer(nn.Module):
         relative_positions = relative_positions.clamp(0, 2 * self.max_relative_positions - 2)  # Bound indices
         return relative_positions
 
-    def add_relative_position_scores(self, attention_scores, seq_len):
+    def add_relative_position_scores(self, attention_scores, seq_len, batch_size):
         """
         Add relative positional embeddings to the attention scores.
-
+    
         Args:
-            attention_scores: Shape (batch_size, num_heads, seq_len, seq_len)
+            attention_scores: Tensor of shape (batch_size, num_heads, seq_len, seq_len)
             seq_len: Sequence length
+            batch_size: Batch size
+    
+        Returns:
+            Updated attention scores with relative positional embeddings
         """
         # Compute relative positions
         relative_positions = self.compute_relative_positions(seq_len)  # Shape: (seq_len, seq_len)
-
-        # Retrieve relative positional embeddings
+    
+        # Retrieve corresponding relative positional embeddings
         relative_position_scores = self.relative_position_embeddings[relative_positions]  # Shape: (seq_len, seq_len, head_dim)
-
-        # Reshape to match attention_scores
-        relative_position_scores = relative_position_scores.permute(2, 0, 1)  # Shape: (head_dim, seq_len, seq_len)
-        relative_position_scores = relative_position_scores.unsqueeze(0).expand(
-            attention_scores.size(0) // self.num_heads, -1, -1, -1
-        )  # Shape: (batch_size * num_heads, head_dim, seq_len, seq_len)
-
-        # Sum along the embedding dimension to align with attention_scores
-        relative_position_scores = relative_position_scores.sum(dim=1)  # Shape: (batch_size * num_heads, seq_len, seq_len)
-
+    
+        # Sum over the embedding dimension (head_dim)
+        relative_position_scores = relative_position_scores.sum(dim=-1)  # Shape: (seq_len, seq_len)
+    
+        # Expand for batch and num_heads
+        relative_position_scores = relative_position_scores.unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, seq_len)
+        relative_position_scores = relative_position_scores.expand(batch_size, self.num_heads, -1, -1)  # Shape: (batch_size, num_heads, seq_len, seq_len)
+    
         # Add relative positional scores to attention scores
         attention_scores += relative_position_scores
         return attention_scores
 
     def forward(self, x, mask=None):
-        """
-        Args:
-            x: Input embeddings, shape (seq_len, batch_size, embed_dim)
-            mask: Optional mask, shape (batch_size, seq_len)
-        Returns:
-            Updated embeddings, shape (seq_len, batch_size, embed_dim)
-        """
         seq_len, batch_size, embed_dim = x.size()
-
+    
+        # Create key padding mask
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = ~mask.bool()  # Invert mask
+    
         # Apply LayerNorm
         x_norm = self.norm1(x)
-
+    
         # Compute Q, K, V
         qkv = self.qkv_proj(x_norm).view(seq_len, batch_size, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # Shape: (seq_len, batch_size, num_heads, head_dim)
-
+    
         # Transpose for multi-head attention compatibility
         q = q.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
         k = k.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
         v = v.permute(1, 2, 0, 3)  # (batch_size, num_heads, seq_len, head_dim)
-
+    
         # Compute attention scores
         attention_scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / (self.head_dim ** 0.5)  # (batch_size, num_heads, seq_len, seq_len)
-
-        # Add relative positional embeddings
-        attention_scores = self.add_relative_position_scores(attention_scores, seq_len)
-
+    
+        # Add relative positional embeddings to scores
+        attention_scores = self.add_relative_position_scores(attention_scores, seq_len, batch_size)
+    
         # Apply mask (optional)
         if mask is not None:
             attention_scores = attention_scores.masked_fill(mask[:, None, :, :], float("-inf"))
-
+    
         # Compute attention probabilities
         attention_probs = F.softmax(attention_scores, dim=-1)  # (batch_size, num_heads, seq_len, seq_len)
         attention_probs = self.dropout(attention_probs)
-
+    
         # Compute attention output
         attention_output = torch.einsum("bhqk,bhkd->bhqd", attention_probs, v)  # (batch_size, num_heads, seq_len, head_dim)
-
+    
         # Concatenate heads
         attention_output = attention_output.permute(2, 0, 1, 3).reshape(seq_len, batch_size, embed_dim)  # (seq_len, batch_size, embed_dim)
-
+    
         # Apply output projection
         attention_output = self.out_proj(attention_output)
-
+    
         # Residual connection
         x = x + self.dropout(attention_output)
-
+    
         # Feedforward layer
         x_norm = self.norm2(x)
         feedforward_output = self.feedforward(x_norm)
         x = x + self.dropout(feedforward_output)
-
+    
         return x
