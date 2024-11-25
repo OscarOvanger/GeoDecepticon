@@ -96,16 +96,16 @@ class TransformerEncoderLayer(nn.Module):
         return relative_positions
 
     def add_relative_position_scores(self, attention_scores, seq_len):
-    """
-    Add relative positional embeddings to the attention scores.
-
-    Args:
-        attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
-        seq_len (int): Length of the sequence.
-
-    Returns:
-        Tensor: Updated attention scores with relative positional embeddings.
-    """
+        """
+        Add relative positional embeddings to the attention scores.
+    
+        Args:
+            attention_scores (Tensor): Attention scores, shape (batch_size * num_heads, seq_len, seq_len).
+            seq_len (int): Length of the sequence.
+    
+        Returns:
+            Tensor: Updated attention scores with relative positional embeddings.
+        """
         # Compute relative positions
         relative_positions = self.compute_relative_positions(seq_len)  # Shape: (seq_len, seq_len)
     
