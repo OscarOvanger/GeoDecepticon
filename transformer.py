@@ -43,8 +43,9 @@ class VisionTransformer(nn.Module):
 
         # Replace masked patches with mask token embedding
         # This step might actually not do anything, but makes sure that no funny business is going on
-        mask_token_embedding = self.embedding_matrix.weight[-1]
-        embeddings[mask.bool()] = mask_token_embedding
+        if mask is not None:
+            mask_token_embedding = self.embedding_matrix.weight[-1]
+            embeddings[mask.bool()] = mask_token_embedding
 
         # Prepare input for transformer layers
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
