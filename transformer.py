@@ -170,9 +170,11 @@ class TransformerEncoderLayer(nn.Module):
         # Apply mask (optional)
         if mask is not None:
             mask = mask.bool()
+            device = attention_scores.device  # Ensure base_mask is created on the same device as attention_scores
+            
             # Step 1: Start with a base mask tensor
             # Shape: (batch_size, seq_len, seq_len)
-            base_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.float)
+            base_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.float, device=device)
             
             # Apply masking rules
             for b in range(batch_size):
