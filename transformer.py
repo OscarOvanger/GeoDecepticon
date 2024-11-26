@@ -94,7 +94,7 @@ class TransformerEncoderLayer(nn.Module):
         )
 
         # Layer normalization
-        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
         # Dropout
