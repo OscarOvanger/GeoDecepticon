@@ -68,7 +68,7 @@ class TransformerEncoderLayer(nn.Module):
         self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
 
         # Positional embeddings
-        self.positional_embeddings = nn.Parameter(torch.randn(1, self.hidden_dim))
+        self.positional_embeddings = nn.Parameter(torch.randn(1, 1024, self.hidden_dim))
 
         # Multi-head attention
         self.multihead_attention = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=num_heads, dropout=dropout)
@@ -95,7 +95,8 @@ class TransformerEncoderLayer(nn.Module):
         z = self.input_proj(x)  # Shape: (seq_len, batch_size, hidden_dim)
 
         # Add learnable positional embeddings
-        z = z + self.positional_embeddings  # Broadcasting to (seq_len, batch_size, hidden_dim)
+        pos_emb = self.positional_embeddings[:, :seq_len, :].permute(1, 0, 2)  # Match shape to (seq_len, batch_size, hidden_dim)
+        z = z + pos_emb  # Broadcasting to (seq_len, batch_size, hidden_dim)
 
         # Apply LayerNorm before attention
         z_norm = self.norm1(z)
