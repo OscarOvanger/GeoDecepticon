@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class VisionTransformer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.0):
+    def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.0,hidden_dim=None):
         super().__init__()
         # Create the embedding matrix for all 2x2 binary combinations + 1 mask token
         embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Shape: (num_tokens, embed_dim)
@@ -30,7 +30,7 @@ class VisionTransformer(nn.Module):
 
         # Transformer encoder layers
         self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, feedforward_dim, dropout)
+            TransformerEncoderLayer(embed_dim, num_heads, feedforward_dim, dropout,hidden_dim = hidden_dim)
             for _ in range(num_layers)
         ])
 
@@ -65,21 +65,25 @@ class VisionTransformer(nn.Module):
 import torch.nn.functional as F
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, max_relative_positions=32):
+    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, max_relative_positions=32, hidden_dim=None):
         super().__init__()
         self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim if hidden_dim else embed_dim  # Default to embed_dim if hidden_dim is not specified
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = self.hidden_dim // num_heads
         self.max_relative_positions = max_relative_positions
 
-        # Ensure embed_dim is divisible by num_heads
+        # Ensure hidden_dim is divisible by num_heads
         assert (
-            self.embed_dim % self.num_heads == 0
-        ), "Embedding dimension must be divisible by the number of heads."
+            self.hidden_dim % self.num_heads == 0
+        ), "Hidden dimension must be divisible by the number of heads."
+
+        # Linear layer to project input embeddings
+        self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
 
         # Self-attention weights
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)  # For queries, keys, and values
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.qkv_proj = nn.Linear(self.hidden_dim, 3 * self.hidden_dim)  # For queries, keys, and values
+        self.out_proj = nn.Linear(self.hidden_dim, embed_dim)  # Project back to embed_dim
 
         # Feedforward network
         self.feedforward = nn.Sequential(
@@ -142,14 +146,11 @@ class TransformerEncoderLayer(nn.Module):
 
     def forward(self, x, mask=None):
         seq_len, batch_size, embed_dim = x.size()
-    
-        # Create key padding mask
-        key_padding_mask = None
-        if mask is not None:
-            key_padding_mask = ~mask.bool()  # Invert mask
-    
+
+        #Project to hidden_dim
+        x_proj = self.input_proj(x) # Shape: (seq_len,batch_size,hidden_dim)
         # Apply LayerNorm
-        x_norm = self.norm1(x)
+        x_norm = self.norm1(x_proj)
     
         # Compute Q, K, V
         qkv = self.qkv_proj(x_norm).view(seq_len, batch_size, 3, self.num_heads, self.head_dim)
@@ -168,8 +169,29 @@ class TransformerEncoderLayer(nn.Module):
     
         # Apply mask (optional)
         if mask is not None:
-            expanded_mask = mask.unsqueeze(1).unsqueeze(2)  # Shape: (batch_size, 1, 1, seq_len)
-            attention_scores = attention_scores.masked_fill(expanded_mask == 0, float("-inf"))
+            mask = mask.bool()
+            # Step 1: Start with a base mask tensor
+            # Shape: (batch_size, seq_len, seq_len)
+            base_mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.float)
+            
+            # Apply masking rules
+            for b in range(batch_size):
+                for i in range(seq_len):
+                    if mask[b, i]:  # If patch is masked
+                        # Mask columns: No one attends to this patch (except itself)
+                        base_mask[b, :, i] = -float('inf')
+                        base_mask[b, i, i] = 0.0  # Preserve self-attention
+                        
+                        # Mask rows: This patch only attends to unmasked patches (and itself)
+                        base_mask[b, i, :] = 0.0  # Allow attention to all initially
+                        base_mask[b, i, mask[b]] = -float('inf')  # Ignore other masked patches
+                        base_mask[b, i, i] = 0.0  # Preserve self-attention
+            
+            # Step 2: Expand base_mask to match attention_scores shape
+            base_mask = base_mask.unsqueeze(1).expand(batch_size, num_heads, seq_len, seq_len)
+            
+            # Step 3: Add the mask to the attention scores
+            attention_scores = attention_scores + base_mask
     
         # Compute attention probabilities
         attention_probs = F.softmax(attention_scores, dim=-1)  # (batch_size, num_heads, seq_len, seq_len)
@@ -179,7 +201,7 @@ class TransformerEncoderLayer(nn.Module):
         attention_output = torch.einsum("bhqk,bhkd->bhqd", attention_probs, v)  # (batch_size, num_heads, seq_len, head_dim)
     
         # Concatenate heads
-        attention_output = attention_output.permute(2, 0, 1, 3).reshape(seq_len, batch_size, embed_dim)  # (seq_len, batch_size, embed_dim)
+        attention_output = attention_output.permute(2, 0, 1, 3).reshape(seq_len, batch_size, self.hidden_dim)  # (seq_len, batch_size, hidden_dim)
     
         # Apply output projection
         attention_output = self.out_proj(attention_output)
