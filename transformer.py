@@ -188,7 +188,7 @@ class TransformerEncoderLayer(nn.Module):
                         base_mask[b, i, i] = 0.0  # Preserve self-attention
             
             # Step 2: Expand base_mask to match attention_scores shape
-            base_mask = base_mask.unsqueeze(1).expand(batch_size, num_heads, seq_len, seq_len)
+            base_mask = base_mask.unsqueeze(1).expand(batch_size, self.num_heads, seq_len, seq_len)
             
             # Step 3: Add the mask to the attention scores
             attention_scores = attention_scores + base_mask
