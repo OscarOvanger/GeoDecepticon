@@ -21,7 +21,7 @@ class VisionTransformer(nn.Module):
             embedding_matrix[i, :] = patch  # Set the embedding to the patch values
 
         # Set the last row to all 2s for the masked patch
-        embedding_matrix[-1, :] = 2  # Mask token embedding
+        embedding_matrix[-1, :] = 0.5  # Mask token embedding
 
         # Create embedding layer
         self.embedding_matrix = nn.Embedding.from_pretrained(
