@@ -58,61 +58,75 @@ class VisionTransformer(nn.Module):
         return torch.softmax(logits, dim=-1)
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, hidden_dim=None):
+    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1, hidden_dim=None, max_patches=1024):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim if hidden_dim else embed_dim  # Default to embed_dim if hidden_dim is not specified
         self.num_heads = num_heads
 
+        # Ensure hidden_dim is divisible by num_heads
+        assert self.hidden_dim % self.num_heads == 0, "Hidden dimension must be divisible by the number of heads."
+
         # Linear layer to project input embeddings
         self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
 
-        # Positional embeddings
-        self.positional_embeddings = nn.Parameter(torch.randn(1, 1024, self.hidden_dim))
-
         # Multi-head attention
-        self.multihead_attention = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=num_heads, dropout=dropout)
+        self.attention = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=num_heads, dropout=dropout)
 
         # Feedforward network
         self.feedforward = nn.Sequential(
-            nn.Linear(embed_dim, feedforward_dim),
+            nn.Linear(self.hidden_dim, feedforward_dim),
             nn.ReLU(),
-            nn.Linear(feedforward_dim, embed_dim),
+            nn.Linear(feedforward_dim, self.hidden_dim),
             nn.Dropout(dropout),
         )
 
         # Layer normalization
         self.norm1 = nn.LayerNorm(self.hidden_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(self.hidden_dim)
+
+        # Positional embeddings
+        self.positional_embedding = nn.Parameter(torch.randn(max_patches, 1, self.hidden_dim))  # Shape: (seq_len, 1, hidden_dim)
+
+        # Linear layer to project back to embed_dim
+        self.output_proj = nn.Linear(self.hidden_dim, self.embed_dim)
 
         # Dropout
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        seq_len, batch_size, _ = x.size()
+        """
+        Args:
+            x: Tensor of shape (seq_len, batch_size, embed_dim)
+        Returns:
+            Tensor of shape (seq_len, batch_size, embed_dim)
+        """
+        seq_len, batch_size, embed_dim = x.size()
 
         # Project input to hidden_dim
         z = self.input_proj(x)  # Shape: (seq_len, batch_size, hidden_dim)
 
-        # Add learnable positional embeddings
-        pos_emb = self.positional_embeddings[:, :seq_len, :].permute(1, 0, 2)  # Match shape to (seq_len, batch_size, hidden_dim)
-        z = z + pos_emb  # Broadcasting to (seq_len, batch_size, hidden_dim)
+        # Add positional embedding
+        pos_emb = self.positional_embedding[:seq_len, :, :].expand(-1, batch_size, -1)  # Shape: (seq_len, batch_size, hidden_dim)
+        z = z + pos_emb
 
-        # Apply LayerNorm before attention
+        # Apply LayerNorm
         z_norm = self.norm1(z)
 
-        # Multi-head attention
-        attention_output, _ = self.multihead_attention(z_norm, z_norm, z_norm)  # Shape: (seq_len, batch_size, hidden_dim)
+        # Self-attention
+        attn_output, _ = self.attention(z_norm, z_norm, z_norm)  # Shape: (seq_len, batch_size, hidden_dim)
 
         # Residual connection
-        z = z + self.dropout(attention_output)
+        z = z + self.dropout(attn_output)
 
-        # Project back to embed_dim
-        z = self.input_proj(z)
-
-        # Feedforward layer with residual connection
+        # Feedforward layer
         z_norm = self.norm2(z)
         feedforward_output = self.feedforward(z_norm)
-        x = z + self.dropout(feedforward_output)
 
-        return x
+        # Final residual connection
+        z = z + self.dropout(feedforward_output)
+
+        # Project back to embed_dim
+        z = self.output_proj(z)  # Shape: (seq_len, batch_size, embed_dim)
+
+        return z
