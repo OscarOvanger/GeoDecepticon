@@ -49,6 +49,8 @@ class VisionTransformer(nn.Module):
         # Prepare input for transformer layers
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
 
+        #Extract seq_len and batch size
+        seq_len,batch_size,_ = x.size()
         # Project input to hidden_dim
         z = self.input_proj(x)  # Shape: (seq_len, batch_size, hidden_dim)
 
