@@ -43,7 +43,7 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(torch.randn(max_patches, 1, self.hidden_dim))  # Shape: (seq_len, 1, hidden_dim)
         
         # Output layer
-        self.fc_out = nn.Linear(self.hidden_dim, num_tokens)
+        self.fc_out = nn.Linear(self.hidden_dim, num_tokens-1)
 
     def forward(self, patches):
         # Retrieve embeddings
