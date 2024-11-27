@@ -6,7 +6,10 @@ class VisionTransformer(nn.Module):
         super().__init__()
         # Create the embedding matrix for all 2x2 binary combinations + 1 mask token
         embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Shape: (num_tokens, embed_dim)
-
+        
+        #Load hidden dim
+        self.hidden_dim = hidden_dim
+        
         # Generate all possible 2x2 binary patches
         patches = torch.tensor([
             [a, b, c, d]
