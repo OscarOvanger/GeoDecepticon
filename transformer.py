@@ -2,128 +2,92 @@ import torch
 import torch.nn as nn
 
 class VisionTransformer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.0, hidden_dim=None):
-        super().__init__()
-        # Create the embedding matrix for all 2x2 binary combinations + 1 mask token
-        embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Shape: (num_tokens, embed_dim)
-        
-        #Load hidden dim
-        self.hidden_dim = hidden_dim
-        
-        # Generate all possible 2x2 binary patches
-        patches = torch.tensor([
-            [a, b, c, d]
-            for a in range(2)
-            for b in range(2)
-            for c in range(2)
-            for d in range(2)
-        ])  # Shape: (16, 4) for 16 combinations of 2x2 patches
+    def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.1):
+        super(VisionTransformer, self).__init__()
+        self.embed_dim = embed_dim
+        self.embedding_matrix = nn.Embedding(num_tokens + 1, embed_dim)  # +1 for masked token
+        self.embedding_matrix.weight.requires_grad = False  # Fixed weights
 
-        # Assign each patch's values as its embedding
-        for i, patch in enumerate(patches):
-            embedding_matrix[i, :] = patch  # Set the embedding to the patch values
-
-        # Set the last row to all 2s for the masked patch
-        embedding_matrix[-1, :] = 0.5  # Mask token embedding
-
-        # Create embedding layer
-        self.embedding_matrix = nn.Embedding.from_pretrained(
-            embedding_matrix, freeze=True
-        )
-
-        # Transformer encoder layers
-        self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_dim, num_heads, feedforward_dim, dropout)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(embed_dim, num_heads, feedforward_dim, dropout)
             for _ in range(num_layers)
         ])
-        # Linear layer to project input embeddings
-        self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
-        
-        # Positional embeddings
-        self.positional_embedding = nn.Parameter(torch.randn(max_patches, 1, self.hidden_dim))  # Shape: (seq_len, 1, hidden_dim)
-        
-        # Output layer
-        self.fc_out = nn.Linear(self.hidden_dim, num_tokens-1)
 
-    def forward(self, patches):
-        # Retrieve embeddings
-        embeddings = self.embedding_matrix(patches)  # (batch_size, seq_len, embed_dim)
+        self.fc_out = nn.Linear(embed_dim, num_tokens)
 
-        # Prepare input for transformer layers
+    def forward(self, patches, mask):
+        embeddings = self.embedding_matrix(patches)
+        embeddings[mask == 1] = self.embedding_matrix.weight[-1]  # Mask token embedding
+
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
+        for layer in self.layers:
+            x = layer(x)
+        x = x.permute(1, 0, 2)  # (batch_size, seq_len, embed_dim)
 
-        #Extract seq_len and batch size
-        seq_len,batch_size,_ = x.size()
-        # Project input to hidden_dim
-        z = self.input_proj(x)  # Shape: (seq_len, batch_size, hidden_dim)
-
-        # Add positional embedding
-        pos_emb = self.positional_embedding[:seq_len, :, :].expand(-1, batch_size, -1)  # Shape: (seq_len, batch_size, hidden_dim)
-        z = z + pos_emb
-
-        # Pass through transformer layers
-        for layer in self.encoder_layers:
-            z = layer(z)
-
-        # Output logits
-        z = z.permute(1, 0, 2)  # Back to (batch_size, seq_len, hidden_dim)
-        logits = self.fc_out(z)  # (batch_size, seq_len, num_tokens)
+        logits = self.fc_out(x)
         return logits
 
     def get_probabilities(self, logits):
-        """Compute probabilities using softmax."""
+        """
+        Computes probabilities using softmax for all patches.
+        Args:
+            logits (Tensor): Logits from the model, shape (batch_size, num_patches, num_tokens).
+
+        Returns:
+            probabilities (Tensor): Probabilities for each token, shape (batch_size, num_patches, num_tokens).
+        """
         return torch.softmax(logits, dim=-1)
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, hidden_dim, num_heads, feedforward_dim, dropout=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-
-        # Ensure hidden_dim is divisible by num_heads
-        assert self.hidden_dim % self.num_heads == 0, "Hidden dimension must be divisible by the number of heads."
-
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=num_heads, dropout=dropout)
-
-        # Feedforward network
+    def __init__(self, embed_dim, num_heads, feedforward_dim, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
         self.feedforward = nn.Sequential(
-            nn.Linear(self.hidden_dim, feedforward_dim),
+            nn.Linear(embed_dim, feedforward_dim),
             nn.ReLU(),
-            nn.Linear(feedforward_dim, self.hidden_dim),
-            nn.Dropout(dropout),
+            nn.Linear(feedforward_dim, embed_dim),
+            nn.Dropout(dropout)
         )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
 
-        # Layer normalization
-        self.norm1 = nn.LayerNorm(self.hidden_dim)
-        self.norm2 = nn.LayerNorm(self.hidden_dim)
+    def forward(self, x):
+        attn_output, _ = self.attention(x, x, x)
+        x = self.norm1(x + attn_output)
+        feedforward_output = self.feedforward(x)
+        x = self.norm2(x + feedforward_output)
+        return x
+    
 
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
+# Test the Vision Transformer
+def test_transformer():
+    print("Testing Vision Transformer...")
 
-    def forward(self, z):
-        """
-        Args:
-            x: Tensor of shape (seq_len, batch_size, embed_dim)
-        Returns:
-            Tensor of shape (seq_len, batch_size, embed_dim)
-        """
-        seq_len, batch_size, hidden_dim = z.size()
+    # Define dummy input
+    batch_size = 2
+    num_patches = 32 * 32  # For 64x64 image with 2x2 patches
+    embed_dim = 4
+    num_tokens = 16
+    masked_token_index = num_tokens  # Mask token index
 
-        # Apply LayerNorm
-        z_norm = self.norm1(z)
+    # Create dummy input data
+    input_patches = torch.randint(0, num_tokens, (batch_size, num_patches))
+    mask = torch.zeros_like(input_patches, dtype=torch.bool)
+    mask[:, :100] = 1  # Mask the first 100 patches
 
-        # Self-attention
-        attn_output, _ = self.attention(z_norm, z_norm, z_norm)  # Shape: (seq_len, batch_size, hidden_dim)
+    # Initialize the model
+    model = VisionTransformer(embed_dim, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=num_tokens, max_patches=num_patches)
 
-        # Residual connection
-        z = z + self.dropout(attn_output)
+    # Forward pass
+    logits = model(input_patches, mask)
+    print("logits:", logits)
+    assert logits.shape == (batch_size, num_patches, num_tokens), "Logits shape is incorrect"
+    print("Logits shape test passed.")
 
-        # Feedforward layer
-        z_norm = self.norm2(z)
-        feedforward_output = self.feedforward(z_norm)
+    # Check probabilities
+    probabilities = model.get_probabilities(logits)
+    print("probabilities:", probabilities)
+    assert torch.allclose(probabilities.sum(dim=-1), torch.ones_like(probabilities.sum(dim=-1)), atol=1e-5), "Probabilities do not sum to 1"
+    print("Softmax probabilities test passed.")
 
-        # Final residual connection
-        z = z + self.dropout(feedforward_output)
-
-        return z
+#test_transformer()

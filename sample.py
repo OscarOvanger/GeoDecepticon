@@ -3,9 +3,9 @@ from transformer import VisionTransformer
 from dataloader import preprocess_image
 
 # Load model
-#model = VisionTransformer(embed_dim=4, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=16, max_patches=1024)
-#model.load_state_dict(torch.load("vision_transformer.pth"))
-#model.eval()
+model = VisionTransformer(embed_dim=4, num_heads=2, feedforward_dim=8, num_layers=2, num_tokens=16, max_patches=1024)
+model.load_state_dict(torch.load("vision_transformer.pth"))
+model.eval()
 
 def sample(image, model, device):
     patch_indices = preprocess_image(image).to(device)
@@ -71,26 +71,19 @@ def reconstruct_image_from_patches(patches):
     Reconstructs a binary 64x64 image from 2x2 patches.
 
     Args:
-        patches (Tensor): Patch indices of shape (num_patches,).
+        patches (Tensor): Patch indices of shape (1024,).
     
     Returns:
         image (Tensor): Reconstructed binary image of shape (64, 64).
     """
+    # Ensure patches are integers before applying bitwise operations
     patches = patches.to(torch.int)
-
-    # Handle negative values (-1 for masked patches)
-    mask = patches == -1  # Boolean mask indicating masked patches
-    patches[mask] = 0  # Temporarily set masked patches to 0 for processing
-
+    
     # Convert indices back to binary patches
     patch_binary = ((patches.unsqueeze(1) & torch.tensor([8, 4, 2, 1], dtype=torch.int)) > 0).float()
 
     # Reshape binary patches into the original image structure
     image = patch_binary.view(32, 32, 2, 2).permute(0, 2, 1, 3).reshape(64, 64)
-
-    # Restore masked patches as distinct value (-1)
-    mask_image = mask.view(32, 32, 1, 1).expand(-1, -1, 2, 2).permute(0, 2, 1, 3).reshape(64, 64)
-    image[mask_image] = -1
     return image
 
 
