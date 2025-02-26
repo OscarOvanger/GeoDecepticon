@@ -13,18 +13,16 @@ class VisionTransformer(nn.Module):
         # Generate all possible 2x2 binary patches
         patches = torch.tensor([
             [a, b, c, d]
-            for a in range(2)
-            for b in range(2)
-            for c in range(2)
-            for d in range(2)
-        ])  # Shape: (16, 4) for 16 combinations of 2x2 patches
+            for a in range(3)
+            for b in range(3)
+            for c in range(3)
+            for d in range(3)
+        ])  # Shape: (81, 4) for 81 combinations of 2x2 patches
 
         # Assign each patch's values as its embedding
         for i, patch in enumerate(patches):
+            patch = torch.where(patch == 2.0,0.5,patch)
             embedding_matrix[i, :] = patch  # Set the embedding to the patch values
-
-        # Set the last row to all 2s for the masked patch
-        embedding_matrix[-1, :] = 0.5  # Mask token embedding
 
         # Create embedding layer
         self.embedding_matrix = nn.Embedding.from_pretrained(
