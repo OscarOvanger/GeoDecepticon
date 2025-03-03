@@ -12,11 +12,10 @@ class ContinuousVisionTransformer(nn.Module):
         # Patch embedding projection
         self.patch_projection = nn.Linear(patch_dim, embed_dim)
         
-        # Learnable mask token embedding (now shape is [1, 1, embed_dim])
+        # Learnable mask token embedding
         self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         
         # Learnable partial mask indicator embedding
-        # This will be added to patches that are partially masked
         self.partial_mask_indicator = nn.Parameter(torch.randn(1, 1, embed_dim))
         
         # Position embeddings
@@ -50,10 +49,9 @@ class ContinuousVisionTransformer(nn.Module):
         
         Args:
             patches: Tensor of shape [batch_size, num_patches, 16] with patch pixel values
-            mask_indices: Boolean tensor of shape [batch_size, num_patches] indicating fully masked patches
-            partial_mask_indices: Boolean tensor of shape [batch_size, num_patches] indicating partially masked patches
-            partial_mask_values: Tensor of shape [batch_size, num_partial_masks, 16] with values for partial masks
-                                (0.5 indicates masked positions, 0 or 1 indicates known positions)
+            mask_indices: Boolean tensor indicating fully masked patches
+            partial_mask_indices: Boolean tensor indicating partially masked patches
+            partial_mask_values: Tensor with values for partial masks
         
         Returns:
             outputs: Dictionary containing model outputs
@@ -61,11 +59,12 @@ class ContinuousVisionTransformer(nn.Module):
         batch_size, num_patches, patch_dim = patches.shape
         device = patches.device
         
-        # Create patch embeddings through linear projection
-        patch_embeddings = self.patch_projection(patches)  # [batch, num_patches, embed_dim]
+        # IMPORTANT: Create a copy of patches to avoid in-place modifications
+        # that would break autograd
+        patches_modified = patches.clone()
         
-        # Store original patches for loss calculation
-        original_patches = patches.clone()
+        # Create patch embeddings through linear projection
+        patch_embeddings = self.patch_projection(patches_modified)
         
         # Apply masking if specified
         if mask_indices is not None:
@@ -74,8 +73,7 @@ class ContinuousVisionTransformer(nn.Module):
                 # Get indices of fully masked patches for this batch
                 full_mask_idx = torch.where(mask_indices[b])[0]
                 if len(full_mask_idx) > 0:
-                    # Reshape mask token to match expected dimensions: [num_masked, embed_dim]
-                    # First remove the middle dimension by squeezing, then expand
+                    # Apply mask token
                     mask_token_expanded = self.mask_token.squeeze(0).expand(len(full_mask_idx), -1)
                     patch_embeddings[b, full_mask_idx] = mask_token_expanded
         
@@ -85,37 +83,32 @@ class ContinuousVisionTransformer(nn.Module):
                 # Get indices of partially masked patches for this batch
                 partial_mask_idx = torch.where(partial_mask_indices[b])[0]
                 if len(partial_mask_idx) > 0:
-                    # Replace patch values with partial mask values
+                    # Process each partially masked patch
                     for i, idx in enumerate(partial_mask_idx):
                         if i < partial_mask_values.size(1):  # Safety check
                             # Get the partial mask pattern
                             partial_values = partial_mask_values[b, i]
                             
-                            # Create partial patch: copy original values but mask some positions
-                            partial_patch = patches[b, idx].clone()
+                            # Create a new patch with partial masking applied
+                            # Instead of modifying patches in-place, we create a new tensor
                             mask_positions = (partial_values == 0.5)
-                            
-                            # Zero out masked positions in the patch
-                            # (but keep the known values from partial_values)
                             partial_patch = torch.where(
                                 mask_positions,
-                                torch.zeros_like(partial_patch),
+                                torch.zeros_like(partial_values),
                                 partial_values
                             )
                             
-                            # Replace the patch with partial mask
-                            patches[b, idx] = partial_patch
-                            
-                            # Update embedding with new value and add partial mask indicator
-                            # First project the partial patch
+                            # Project the modified patch
                             projected_patch = self.patch_projection(partial_patch)
-                            # Add the partial mask indicator (removing extra dimension)
+                            
+                            # Add the partial mask indicator
                             partial_indicator = self.partial_mask_indicator.squeeze(0).squeeze(0)
-                            # Set the embedding
+                            
+                            # Update embedding
                             patch_embeddings[b, idx] = projected_patch + partial_indicator
         
         # Add position embeddings
-        embeddings = patch_embeddings + self.pos_embedding[:, :num_patches]  # [batch, num_patches, embed_dim]
+        embeddings = patch_embeddings + self.pos_embedding[:, :num_patches]
         
         # Process through transformer layers
         x = embeddings.permute(1, 0, 2)  # [num_patches, batch, embed_dim]
@@ -124,7 +117,7 @@ class ContinuousVisionTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # [batch, num_patches, embed_dim]
         
         # Decode to patch values
-        patch_logits = self.patch_decoder(x)  # [batch, num_patches, patch_dim]
+        patch_logits = self.patch_decoder(x)
         
         # Apply sigmoid to get probabilities for each position
         patch_probs = torch.sigmoid(patch_logits)
@@ -134,10 +127,10 @@ class ContinuousVisionTransformer(nn.Module):
         
         # Prepare outputs
         outputs = {
-            'logits': patch_logits,         # Raw logits for each position
-            'probabilities': patch_probs,   # Probability of each position being 1
-            'binary_prediction': binary_pred,  # Thresholded binary prediction
-            'embeddings': x                 # Final embeddings
+            'logits': patch_logits,
+            'probabilities': patch_probs,
+            'binary_prediction': binary_pred,
+            'embeddings': x
         }
         
         return outputs
@@ -145,17 +138,8 @@ class ContinuousVisionTransformer(nn.Module):
     def get_loss(self, outputs, original_patches, mask_indices=None, partial_mask_indices=None):
         """
         Calculate BCE loss for patch reconstruction.
-        
-        Args:
-            outputs: Dictionary from forward pass
-            original_patches: Original patch values [batch, num_patches, patch_dim]
-            mask_indices: Boolean tensor for fully masked patches [batch, num_patches]
-            partial_mask_indices: Boolean tensor for partially masked patches [batch, num_patches]
-            
-        Returns:
-            loss: Binary cross entropy loss
         """
-        batch_size, num_patches, patch_dim = original_patches.shape
+        batch_size = original_patches.size(0)
         logits = outputs['logits']
         
         # Combine full and partial mask indices
@@ -169,25 +153,25 @@ class ContinuousVisionTransformer(nn.Module):
             # If no masks specified, compute loss over all patches
             combined_mask = torch.ones_like(original_patches[:, :, 0], dtype=torch.bool)
         
-        # Flatten tensors for loss calculation
-        masked_logits = []
-        masked_targets = []
+        # Extract masked positions for loss calculation
+        masked_logits_list = []
+        masked_targets_list = []
         
         for b in range(batch_size):
             # Get indices of masked patches for this batch
             masked_idx = torch.where(combined_mask[b])[0]
             if len(masked_idx) > 0:
                 # Extract logits and targets for masked positions
-                b_logits = logits[b, masked_idx].reshape(-1)  # Flatten
-                b_targets = original_patches[b, masked_idx].reshape(-1)  # Flatten
+                b_logits = logits[b, masked_idx].reshape(-1)
+                b_targets = original_patches[b, masked_idx].reshape(-1)
                 
-                masked_logits.append(b_logits)
-                masked_targets.append(b_targets)
+                masked_logits_list.append(b_logits)
+                masked_targets_list.append(b_targets)
         
-        if masked_logits:
+        if masked_logits_list:
             # Concatenate all masked positions
-            masked_logits = torch.cat(masked_logits)
-            masked_targets = torch.cat(masked_targets)
+            masked_logits = torch.cat(masked_logits_list)
+            masked_targets = torch.cat(masked_targets_list)
             
             # Calculate binary cross entropy loss with logits
             loss = F.binary_cross_entropy_with_logits(
@@ -197,21 +181,14 @@ class ContinuousVisionTransformer(nn.Module):
             )
         else:
             # Default loss if no masked positions
-            loss = torch.tensor(0.0, device=logits.device)
+            loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
         
         return loss
     
     def apply_masking(self, patches, num_masks, partial_mask_ratio=0.3):
         """
         Apply masking to patches with support for partial masking.
-        
-        Args:
-            patches: Tensor of shape [batch_size, num_patches, patch_dim]
-            num_masks: Number of patches to mask per image
-            partial_mask_ratio: Ratio of masks that should be partial
-            
-        Returns:
-            dict: Contains masked patches and masking information
+        Returns masking information but does NOT modify patches in-place.
         """
         batch_size, num_patches, patch_dim = patches.shape
         device = patches.device
@@ -227,8 +204,8 @@ class ContinuousVisionTransformer(nn.Module):
         num_partial = min(int(num_masks * partial_mask_ratio), num_masks)
         num_full = num_masks - num_partial
         
-        # Storage for partial mask values (pre-allocate max size)
-        max_partial = max(1, num_partial)  # Ensure at least size 1 to avoid empty tensor issues
+        # Storage for partial mask values
+        max_partial = max(1, num_partial)
         partial_values = torch.zeros((batch_size, max_partial, patch_dim), device=device)
         
         for b in range(batch_size):
@@ -247,23 +224,23 @@ class ContinuousVisionTransformer(nn.Module):
             
             # Create partial mask values
             for i, idx in enumerate(partial_indices):
-                # Get original patch
-                orig_patch = patches[b, idx].clone()
-                
-                # Create a partial mask where most values are masked (0.5)
-                # but one or a few values are kept
-                partial_patch = torch.ones_like(orig_patch) * 0.5
-                
-                # Randomly select positions to keep (1-3 positions)
-                num_to_keep = torch.randint(1, min(4, patch_dim), (1,)).item()
-                keep_positions = torch.randperm(patch_dim)[:num_to_keep]
-                
-                # Keep original values at selected positions
-                for pos in keep_positions:
-                    partial_patch[pos] = orig_patch[pos]
-                
-                # Store partial patch values
-                if i < partial_values.size(1):  # Safety check
+                if i < max_partial:  # Safety check
+                    # Get original patch (without modifying it)
+                    orig_patch = patches[b, idx]
+                    
+                    # Create a partial mask
+                    partial_patch = torch.ones(patch_dim, device=device) * 0.5
+                    
+                    # Randomly select positions to keep (1-3 positions)
+                    num_to_keep = torch.randint(1, min(4, patch_dim), (1,)).item()
+                    keep_positions = torch.randperm(patch_dim, device=device)[:num_to_keep]
+                    
+                    # Create a new tensor for the partial mask
+                    for pos in keep_positions:
+                        # New tensor creation instead of in-place modification
+                        partial_patch[pos] = orig_patch[pos].clone()
+                    
+                    # Store the partial patch
                     partial_values[b, i] = partial_patch
         
         return {
@@ -275,15 +252,7 @@ class ContinuousVisionTransformer(nn.Module):
     def reconstruct_image(self, patch_values, image_size=64):
         """
         Reconstruct full image from patch values.
-        
-        Args:
-            patch_values: Tensor of shape [num_patches, patch_dim] with binary values
-            image_size: Size of the square output image
-            
-        Returns:
-            Tensor: Reconstructed image of shape [image_size, image_size]
         """
-        # For 4x4 patches in a 64x64 image
         patches_per_dim = image_size // 4
         
         # Initialize output image
@@ -294,12 +263,12 @@ class ContinuousVisionTransformer(nn.Module):
             for j in range(patches_per_dim):
                 # Get patch index
                 idx = i * patches_per_dim + j
-                
-                # Reshape patch to 4x4
-                patch = patch_values[idx].reshape(4, 4)
-                
-                # Place patch in image
-                image[i*4:(i+1)*4, j*4:(j+1)*4] = patch
+                if idx < patch_values.size(0):  # Safety check
+                    # Reshape patch to 4x4
+                    patch = patch_values[idx].reshape(4, 4)
+                    
+                    # Place patch in image (copy, not in-place)
+                    image[i*4:(i+1)*4, j*4:(j+1)*4] = patch.clone()
         
         return image
 
@@ -319,7 +288,7 @@ class TransformerEncoderLayer(nn.Module):
         # Feedforward network
         self.feedforward = nn.Sequential(
             nn.Linear(self.hidden_dim, feedforward_dim),
-            nn.GELU(),  # Using GELU as in standard ViT
+            nn.GELU(),
             nn.Linear(feedforward_dim, self.hidden_dim),
             nn.Dropout(dropout),
         )
@@ -338,7 +307,7 @@ class TransformerEncoderLayer(nn.Module):
         # Self-attention
         attn_output, _ = self.attention(z_norm, z_norm, z_norm)
         
-        # Residual connection
+        # Residual connection (addition, not in-place)
         z = z + self.dropout(attn_output)
         
         # Apply LayerNorm before feedforward
