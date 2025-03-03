@@ -12,7 +12,7 @@ class ContinuousVisionTransformer(nn.Module):
         # Patch embedding projection
         self.patch_projection = nn.Linear(patch_dim, embed_dim)
         
-        # Learnable mask token embedding
+        # Learnable mask token embedding (now shape is [1, 1, embed_dim])
         self.mask_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         
         # Learnable partial mask indicator embedding
@@ -53,7 +53,7 @@ class ContinuousVisionTransformer(nn.Module):
             mask_indices: Boolean tensor of shape [batch_size, num_patches] indicating fully masked patches
             partial_mask_indices: Boolean tensor of shape [batch_size, num_patches] indicating partially masked patches
             partial_mask_values: Tensor of shape [batch_size, num_partial_masks, 16] with values for partial masks
-                                 (0.5 indicates masked positions, 0 or 1 indicates known positions)
+                                (0.5 indicates masked positions, 0 or 1 indicates known positions)
         
         Returns:
             outputs: Dictionary containing model outputs
@@ -74,8 +74,10 @@ class ContinuousVisionTransformer(nn.Module):
                 # Get indices of fully masked patches for this batch
                 full_mask_idx = torch.where(mask_indices[b])[0]
                 if len(full_mask_idx) > 0:
-                    # Replace with mask token
-                    patch_embeddings[b, full_mask_idx] = self.mask_token.expand(len(full_mask_idx), -1)
+                    # Reshape mask token to match expected dimensions: [num_masked, embed_dim]
+                    # First remove the middle dimension by squeezing, then expand
+                    mask_token_expanded = self.mask_token.squeeze(0).expand(len(full_mask_idx), -1)
+                    patch_embeddings[b, full_mask_idx] = mask_token_expanded
         
         # Apply partial masking if specified
         if partial_mask_indices is not None and partial_mask_values is not None:
@@ -105,7 +107,12 @@ class ContinuousVisionTransformer(nn.Module):
                             patches[b, idx] = partial_patch
                             
                             # Update embedding with new value and add partial mask indicator
-                            patch_embeddings[b, idx] = self.patch_projection(partial_patch) + self.partial_mask_indicator
+                            # First project the partial patch
+                            projected_patch = self.patch_projection(partial_patch)
+                            # Add the partial mask indicator (removing extra dimension)
+                            partial_indicator = self.partial_mask_indicator.squeeze(0).squeeze(0)
+                            # Set the embedding
+                            patch_embeddings[b, idx] = projected_patch + partial_indicator
         
         # Add position embeddings
         embeddings = patch_embeddings + self.pos_embedding[:, :num_patches]  # [batch, num_patches, embed_dim]
@@ -213,8 +220,15 @@ class ContinuousVisionTransformer(nn.Module):
         full_mask = torch.zeros((batch_size, num_patches), dtype=torch.bool, device=device)
         partial_mask = torch.zeros((batch_size, num_patches), dtype=torch.bool, device=device)
         
+        # Make sure num_masks doesn't exceed the number of patches
+        num_masks = min(num_masks, num_patches)
+        
+        # Calculate how many should be partial masks
+        num_partial = min(int(num_masks * partial_mask_ratio), num_masks)
+        num_full = num_masks - num_partial
+        
         # Storage for partial mask values (pre-allocate max size)
-        max_partial = int(num_masks * partial_mask_ratio) + 1
+        max_partial = max(1, num_partial)  # Ensure at least size 1 to avoid empty tensor issues
         partial_values = torch.zeros((batch_size, max_partial, patch_dim), device=device)
         
         for b in range(batch_size):
@@ -222,9 +236,8 @@ class ContinuousVisionTransformer(nn.Module):
             mask_indices = torch.randperm(num_patches, device=device)[:num_masks]
             
             # Split between full and partial masks
-            num_partial = int(num_masks * partial_mask_ratio)
-            full_indices = mask_indices[num_partial:]
-            partial_indices = mask_indices[:num_partial]
+            full_indices = mask_indices[:num_full]
+            partial_indices = mask_indices[num_full:num_masks]
             
             # Mark fully masked patches
             full_mask[b, full_indices] = True
@@ -242,7 +255,7 @@ class ContinuousVisionTransformer(nn.Module):
                 partial_patch = torch.ones_like(orig_patch) * 0.5
                 
                 # Randomly select positions to keep (1-3 positions)
-                num_to_keep = torch.randint(1, 4, (1,)).item()
+                num_to_keep = torch.randint(1, min(4, patch_dim), (1,)).item()
                 keep_positions = torch.randperm(patch_dim)[:num_to_keep]
                 
                 # Keep original values at selected positions
@@ -250,7 +263,8 @@ class ContinuousVisionTransformer(nn.Module):
                     partial_patch[pos] = orig_patch[pos]
                 
                 # Store partial patch values
-                partial_values[b, i] = partial_patch
+                if i < partial_values.size(1):  # Safety check
+                    partial_values[b, i] = partial_patch
         
         return {
             'full_mask': full_mask,
