@@ -1,47 +1,73 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 class VisionTransformer(nn.Module):
-    def __init__(self, embed_dim, num_heads, feedforward_dim, num_layers, num_tokens, max_patches, dropout=0.0, hidden_dim=None):
+    def __init__(self, num_heads, feedforward_dim, num_layers, unique_patches, 
+                 max_patches, dropout=0.0, hidden_dim=None, num_partial_masks=32):
         super().__init__()
-        # Create the embedding matrix for all 2x2 binary combinations + 1 mask token
-        embedding_matrix = torch.zeros((num_tokens, embed_dim))  # Shape: (num_tokens, embed_dim)
+        # For 4x4 patches, embed_dim is 16
+        embed_dim = 16
         
-        #Load hidden dim
-        self.hidden_dim = hidden_dim
+        # Store unique patches information
+        self.unique_patches = unique_patches  # List of unique patch tensors
         
-        # Generate all possible 2x2 binary patches
-        patches = torch.tensor([
-            [a, b, c, d]
-            for a in range(3)
-            for b in range(3)
-            for c in range(3)
-            for d in range(3)
-        ])  # Shape: (81, 4) for 81 combinations of 2x2 patches
-
-        # Assign each patch's values as its embedding
-        for i, patch in enumerate(patches):
-            patch = torch.where(patch == 2.0,0.5,patch)
-            embedding_matrix[i, :] = patch  # Set the embedding to the patch values
-
-        # Create embedding layer
-        self.embedding_matrix = nn.Embedding.from_pretrained(
-            embedding_matrix, freeze=True
-        )
-
+        # Calculate number of tokens: unique patches + 1 mask token + partial masks
+        self.num_tokens = len(unique_patches) + 1 + num_partial_masks
+        
+        # Create the embedding matrix
+        self.embedding_matrix = self._create_embedding_matrix(embed_dim, num_partial_masks)
+        
+        # Load hidden dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else 64
+        
         # Transformer encoder layers
         self.encoder_layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_dim, num_heads, feedforward_dim, dropout)
+            TransformerEncoderLayer(self.hidden_dim, num_heads, feedforward_dim, dropout)
             for _ in range(num_layers)
         ])
+        
         # Linear layer to project input embeddings
         self.input_proj = nn.Linear(embed_dim, self.hidden_dim)
         
         # Positional embeddings
-        self.positional_embedding = nn.Parameter(torch.randn(max_patches, 1, self.hidden_dim))  # Shape: (seq_len, 1, hidden_dim)
+        self.positional_embedding = nn.Parameter(torch.randn(max_patches, 1, self.hidden_dim))
         
         # Output layer
-        self.fc_out = nn.Linear(self.hidden_dim, 2**embed_dim)
+        self.fc_out = nn.Linear(self.hidden_dim, self.num_tokens - 1)  # -1 because we don't predict the mask token
+    
+    def _create_embedding_matrix(self, embed_dim, num_partial_masks):
+        """Create embedding matrix for unique patches + mask token + partial masks"""
+        # Initialize embedding matrix
+        embedding_matrix = torch.zeros((self.num_tokens, embed_dim))
+        
+        # First, add embeddings for all unique patches
+        for i, patch in enumerate(self.unique_patches):
+            embedding_matrix[i] = patch
+        
+        # Add embedding for the mask token (at index len(unique_patches))
+        mask_token_idx = len(self.unique_patches)
+        embedding_matrix[mask_token_idx] = torch.tensor([0.5] * embed_dim)
+        
+        # Add embeddings for partially masked tokens
+        # We'll focus on the case where one position is known (as you requested)
+        partial_mask_start_idx = mask_token_idx + 1
+        partial_mask_count = 0
+        
+        # Add partial masks systematically (up to the limit)
+        for position in range(min(embed_dim, 16)):  # Only create partial masks for first 16 positions if needed
+            for value in [0, 1]:  # Binary values
+                if partial_mask_count >= num_partial_masks:
+                    break
+                    
+                idx = partial_mask_start_idx + partial_mask_count
+                # Create a tensor of 0.5s with one position set to the known value
+                patch_values = torch.tensor([0.5] * embed_dim)
+                patch_values[position] = float(value)
+                embedding_matrix[idx] = patch_values
+                partial_mask_count += 1
+        
+        return nn.Embedding.from_pretrained(embedding_matrix, freeze=True)
 
     def forward(self, patches):
         # Retrieve embeddings
@@ -50,13 +76,14 @@ class VisionTransformer(nn.Module):
         # Prepare input for transformer layers
         x = embeddings.permute(1, 0, 2)  # (seq_len, batch_size, embed_dim)
 
-        #Extract seq_len and batch size
-        seq_len,batch_size,_ = x.size()
+        # Extract seq_len and batch size
+        seq_len, batch_size, _ = x.size()
+        
         # Project input to hidden_dim
         z = self.input_proj(x)  # Shape: (seq_len, batch_size, hidden_dim)
 
         # Add positional embedding
-        pos_emb = self.positional_embedding[:seq_len, :, :].expand(-1, batch_size, -1)  # Shape: (seq_len, batch_size, hidden_dim)
+        pos_emb = self.positional_embedding[:seq_len, :, :].expand(-1, batch_size, -1)
         z = z + pos_emb
 
         # Pass through transformer layers
@@ -65,12 +92,13 @@ class VisionTransformer(nn.Module):
 
         # Output logits
         z = z.permute(1, 0, 2)  # Back to (batch_size, seq_len, hidden_dim)
-        logits = self.fc_out(z)  # (batch_size, seq_len, num_tokens)
+        logits = self.fc_out(z)  # (batch_size, seq_len, num_tokens-1)
         return logits
 
     def get_probabilities(self, logits):
         """Compute probabilities using softmax."""
         return torch.softmax(logits, dim=-1)
+
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, hidden_dim, num_heads, feedforward_dim, dropout=0.1):
@@ -100,19 +128,11 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, z):
-        """
-        Args:
-            x: Tensor of shape (seq_len, batch_size, embed_dim)
-        Returns:
-            Tensor of shape (seq_len, batch_size, embed_dim)
-        """
-        seq_len, batch_size, hidden_dim = z.size()
-
         # Apply LayerNorm
         z_norm = self.norm1(z)
 
         # Self-attention
-        attn_output, _ = self.attention(z_norm, z_norm, z_norm)  # Shape: (seq_len, batch_size, hidden_dim)
+        attn_output, _ = self.attention(z_norm, z_norm, z_norm)
 
         # Residual connection
         z = z + self.dropout(attn_output)
