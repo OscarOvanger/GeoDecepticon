@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import wandb
+from generating_images import generate_image_autoregressively
 
 class BinaryImageDataset(Dataset):
     def __init__(self, images):
