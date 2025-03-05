@@ -3,7 +3,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import wandb
-from generating_images import generate_image_autoregressively
 
 class BinaryImageDataset(Dataset):
     def __init__(self, images):
@@ -131,7 +130,8 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
     Returns:
         dict: Dictionary of images for wandb logging
     """
-    from autoregressive_generation import generate_image_autoregressively
+    # Import here to avoid circular imports
+    from generating_images import generate_image_autoregressively
     
     model.eval()
     
@@ -199,7 +199,8 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
         images[f"masked_{i}"] = wandb.Image(masked, caption=f"Masked {i} ({num_masks} masks)")
         images[f"reconstructed_{i}"] = wandb.Image(reconstructed, caption=f"Reconstructed {i}")
     
-    # Generate images autoregressively (1 sample)
+    # Generate images autoregressively (1 sample) - but make this optional
+    # in case the function is not available
     try:
         generated_image = generate_image_autoregressively(model, device, temperature=1.0)
         images["autoregressive_generation"] = wandb.Image(
@@ -207,7 +208,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
             caption="Autoregressive Generation"
         )
     except Exception as e:
-        print(f"Error generating autoregressive image: {e}")
+        print(f"Warning: Could not generate autoregressive image: {e}")
     
     # Also generate images in parallel (non-autoregressive) if we're at high masking rates
     if num_masks >= 128:
@@ -224,6 +225,6 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
                 caption="Parallel (Non-autoregressive) Generation"
             )
         except Exception as e:
-            print(f"Error generating parallel image: {e}")
+            print(f"Warning: Could not generate parallel image: {e}")
     
     return images
