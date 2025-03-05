@@ -135,53 +135,67 @@ class ContinuousVisionTransformer(nn.Module):
         
         return outputs
     
-    def get_loss(self, outputs, original_patches, mask_indices=None, partial_mask_indices=None):
+    def get_loss(self, outputs, original_patches, mask_indices=None, partial_mask_indices=None, partial_mask_values=None):
         """
-        Calculate BCE loss for patch reconstruction.
+        Calculate BCE loss for patch reconstruction, properly handling partial masking.
+        
+        Args:
+            outputs: Dictionary from forward pass with 'logits'
+            original_patches: Original patch values [batch, num_patches, patch_dim]
+            mask_indices: Boolean tensor for fully masked patches [batch, num_patches]
+            partial_mask_indices: Boolean tensor for partially masked patches [batch, num_patches]
+            partial_mask_values: Tensor with values for partial masks [batch, num_partial, patch_dim]
+                Values of 0.5 indicate masked positions, 0/1 indicate known positions
+                
+        Returns:
+            loss: Binary cross entropy loss computed only on masked pixel positions
         """
-        batch_size = original_patches.size(0)
+        batch_size, num_patches, patch_dim = original_patches.shape
+        device = original_patches.device
         logits = outputs['logits']
         
-        # Combine full and partial mask indices
-        if mask_indices is not None and partial_mask_indices is not None:
-            combined_mask = mask_indices | partial_mask_indices
-        elif mask_indices is not None:
-            combined_mask = mask_indices
-        elif partial_mask_indices is not None:
-            combined_mask = partial_mask_indices
-        else:
-            # If no masks specified, compute loss over all patches
-            combined_mask = torch.ones_like(original_patches[:, :, 0], dtype=torch.bool)
+        # Initialize pixel-level mask
+        pixel_mask = torch.zeros((batch_size, num_patches, patch_dim), dtype=torch.bool, device=device)
         
-        # Extract masked positions for loss calculation
-        masked_logits_list = []
-        masked_targets_list = []
+        # Handle fully masked patches - all pixels are masked
+        if mask_indices is not None:
+            for b in range(batch_size):
+                full_mask_indices = torch.where(mask_indices[b])[0]
+                if len(full_mask_indices) > 0:
+                    # Mark all pixels in fully masked patches
+                    pixel_mask[b, full_mask_indices] = True
         
-        for b in range(batch_size):
-            # Get indices of masked patches for this batch
-            masked_idx = torch.where(combined_mask[b])[0]
-            if len(masked_idx) > 0:
-                # Extract logits and targets for masked positions
-                b_logits = logits[b, masked_idx].reshape(-1)
-                b_targets = original_patches[b, masked_idx].reshape(-1)
-                
-                masked_logits_list.append(b_logits)
-                masked_targets_list.append(b_targets)
+        # Handle partially masked patches - only mask unknown positions
+        if partial_mask_indices is not None and partial_mask_values is not None:
+            for b in range(batch_size):
+                partial_indices = torch.where(partial_mask_indices[b])[0]
+                for i, patch_idx in enumerate(partial_indices):
+                    if i < partial_mask_values.size(1):  # Safety check
+                        # In partial masks, 0.5 indicates masked (unknown) positions
+                        unknown_positions = (partial_mask_values[b, i] == 0.5)
+                        # Only mark unknown positions as masked
+                        pixel_mask[b, patch_idx, unknown_positions] = True
         
-        if masked_logits_list:
-            # Concatenate all masked positions
-            masked_logits = torch.cat(masked_logits_list)
-            masked_targets = torch.cat(masked_targets_list)
-            
-            # Calculate binary cross entropy loss with logits
-            loss = F.binary_cross_entropy_with_logits(
-                masked_logits, 
-                masked_targets,
-                reduction='mean'
-            )
-        else:
-            # Default loss if no masked positions
-            loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+        # If no masking specified at all, use all pixels
+        if mask_indices is None and partial_mask_indices is None:
+            pixel_mask = torch.ones_like(pixel_mask)
+        
+        # Count masked pixels for validation
+        num_masked_pixels = pixel_mask.sum().item()
+        if num_masked_pixels == 0:
+            # No pixels to predict, return zero loss
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Extract only the masked pixel positions
+        masked_logits = logits[pixel_mask]
+        masked_targets = original_patches[pixel_mask]
+        
+        # Calculate binary cross entropy loss on masked pixels only
+        loss = F.binary_cross_entropy_with_logits(
+            masked_logits,
+            masked_targets,
+            reduction='mean'
+        )
         
         return loss
     
