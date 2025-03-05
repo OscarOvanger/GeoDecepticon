@@ -230,7 +230,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
     
     # Get a batch of data
     patches = next(iter(dataloader)).to(device)
-    batch_size = min(4, patches.size(0))  # Limit to 4 images for visualization
+    batch_size = min(1, patches.size(0))  # Limit to 4 images for visualization
     patches = patches[:batch_size]
     
     # Apply normal masking
