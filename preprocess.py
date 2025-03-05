@@ -1,67 +1,8 @@
 import torch
-from torch.utils.data import Dataset
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
-
-def preprocess_image(image, tokenizer):
-    """
-    Splits a binary 64x64 image into flattened 4x4 patches and converts to token IDs.
-    
-    Args:
-        image: Tensor of shape (64, 64) with binary values
-        tokenizer: PatchTokenizer instance for encoding patches
-        
-    Returns:
-        Tensor: Token IDs for each 4x4 patch in the image (256 tokens for 64x64 image)
-    """
-    # Ensure image is the right shape
-    if image.shape != (64, 64):
-        raise ValueError(f"Expected image shape (64, 64), got {image.shape}")
-    
-    # Extract 4x4 patches
-    patches = image.unfold(0, 4, 4).unfold(1, 4, 4)
-    patches = patches.contiguous().view(-1, 16)  # Shape: (256, 16)
-    
-    # Convert each patch to a token ID
-    patch_indices = torch.zeros(patches.size(0), dtype=torch.long)
-    for i, patch in enumerate(patches):
-        patch_indices[i] = tokenizer.encode(patch)
-    
-    return patch_indices
-
-
-def reconstruct_image_from_patches(patch_indices, tokenizer):
-    """
-    Reconstructs a 64x64 image from patch token indices.
-    
-    Args:
-        patch_indices: Tensor of token indices of shape (256)
-        tokenizer: PatchTokenizer instance for decoding tokens
-        
-    Returns:
-        Tensor: Reconstructed image of shape (64, 64)
-    """
-    # Initialize the reconstructed image
-    reconstructed_image = torch.zeros((64, 64))
-    
-    # Calculate the number of patches in each dimension
-    patches_per_dim = 16  # 16 patches per dimension for 4x4 patches in a 64x64 image
-    
-    for i in range(patches_per_dim):
-        for j in range(patches_per_dim):
-            # Get the patch index
-            idx = i * patches_per_dim + j
-            token_id = patch_indices[idx].item()
-            
-            # Decode the token to get patch values
-            patch_values = tokenizer.decode(token_id)
-            
-            # Reshape to 4x4
-            patch_values = patch_values.reshape(4, 4)
-            
-            # Place the patch in the image
-            reconstructed_image[i*4:(i+1)*4, j*4:(j+1)*4] = patch_values
-    
-    return reconstructed_image
+import wandb
 
 class BinaryImageDataset(Dataset):
     def __init__(self, images):
@@ -122,29 +63,27 @@ def collate_fn(batch):
 
 def calculate_mask_count(epoch, num_epochs, max_patches=256):
     """
-    Sigmoid-based masking schedule to gradually approach 100% masking.
+    Improved sigmoid-based masking schedule for faster progression to 100% masking.
     
     Args:
         epoch: Current epoch
         num_epochs: Total number of epochs
-        max_patches: Maximum number of patches to mask (usually total patches)
+        max_patches: Maximum number of patches to mask
         
     Returns:
         int: Number of patches to mask
     """
     min_masks = 4
-    # Use sigmoid function for smoother progression to 100% masking
-    # Slower at start and end, faster in middle
+    # Steeper sigmoid curve with midpoint earlier in training (40% of epochs)
+    # Slope increased from 10 to 12 for faster transition
     progress = epoch / num_epochs
-    # Steepness of 10 centers the faster growth around the middle epochs
-    sigmoid = 1 / (1 + np.exp(-10 * (progress - 0.5)))
-    # Scale sigmoid output (0-1) to range from min_masks to max_patches
+    sigmoid = 1 / (1 + np.exp(-12 * (progress - 0.4)))
     mask_count = min_masks + (max_patches - min_masks) * sigmoid
     return int(mask_count)
 
 def get_lr(epoch, num_epochs, base_lr=1e-4, min_lr=1e-6):
     """
-    Learning rate schedule with warmup and cosine decay.
+    Learning rate schedule with warmup, milestone boosts, and cosine decay.
     
     Args:
         epoch: Current epoch
@@ -156,65 +95,30 @@ def get_lr(epoch, num_epochs, base_lr=1e-4, min_lr=1e-6):
         float: Learning rate for current epoch
     """
     warmup = 5  # Warmup epochs
+    
+    # Milestone epochs where masking increases significantly - boost learning rate
+    milestones = [int(num_epochs * x) for x in [0.2, 0.4, 0.6, 0.8]]
+    boost_factor = 1.5
+    
+    # Check if at milestone
+    at_milestone = epoch in milestones
+    
     if epoch < warmup:
+        # Warmup phase
         return base_lr * (epoch + 1) / warmup
+    elif at_milestone:
+        # Boost learning rate at masking milestones
+        return min(base_lr * boost_factor, 1e-3)
     else:
         # Cosine decay with minimum lr
         progress = (epoch - warmup) / max(1, (num_epochs - warmup))
         cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
         return min_lr + (base_lr - min_lr) * cosine_decay
 
-def generate_complete_image(model, device='cuda', batch_size=16, size=64):
-    """
-    Generate complete images from scratch (100% masked reconstruction).
-    
-    Args:
-        model: Trained ContinuousVisionTransformer model
-        device: Device to use
-        batch_size: Number of images to generate
-        size: Image size (default 64x64)
-        
-    Returns:
-        torch.Tensor: Generated images
-    """
-    model.eval()
-    patch_size = 4
-    num_patches = (size // patch_size) ** 2  # 256 for 64x64 image with 4x4 patches
-    patch_dim = 16  # 4x4 patches flattened
-    
-    # Create dummy patches (all zeros)
-    patches = torch.zeros((batch_size, num_patches, patch_dim), device=device)
-    
-    # Create mask for all patches (100% masking)
-    mask = torch.ones((batch_size, num_patches), dtype=torch.bool, device=device)
-    
-    # No partial masking in this case
-    partial_mask = torch.zeros((batch_size, num_patches), dtype=torch.bool, device=device)
-    
-    # Generate images
-    with torch.no_grad():
-        outputs = model(
-            patches, 
-            mask_indices=mask, 
-            partial_mask_indices=partial_mask,
-            partial_mask_values=None
-        )
-        
-    # Get binary predictions
-    binary_pred = outputs['binary_prediction']
-    
-    # Reconstruct full images
-    generated_images = []
-    for i in range(batch_size):
-        image = model.reconstruct_image(binary_pred[i])
-        generated_images.append(image)
-    
-    return torch.stack(generated_images)
-
 def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
     """
-    Create visualizations for original, masked, and reconstructed images.
-    Also generate fully masked (100%) reconstructions.
+    Create visualizations for wandb logging - both partial masking reconstructions
+    and autoregressive generation.
     
     Args:
         model: Trained model
@@ -226,21 +130,30 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
     Returns:
         dict: Dictionary of images for wandb logging
     """
+    from autoregressive_generation import generate_image_autoregressively
+    
     model.eval()
     
     # Get a batch of data
     patches = next(iter(dataloader)).to(device)
-    batch_size = min(1, patches.size(0))  # Limit to 4 images for visualization
+    batch_size = min(4, patches.size(0))  # Limit to 4 images for visualization
     patches = patches[:batch_size]
     
     # Apply normal masking
     if num_masks is None:
-        num_masks = 64  # Default moderate masking
+        num_masks = min(64, calculate_mask_count(epoch, 1000, max_patches=256))
     
+    # Adjust partial mask ratio for high masking rates
+    if num_masks > 128:  # When masking more than 50% of patches
+        partial_mask_ratio = max(0.1, min(0.5, 32 / num_masks))
+    else:
+        partial_mask_ratio = 0.3
+    
+    # Create masking info
     masking_info = model.apply_masking(
         patches, 
         num_masks=num_masks,
-        partial_mask_ratio=0.3
+        partial_mask_ratio=partial_mask_ratio
     )
     
     # Get reconstructions
@@ -266,7 +179,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
         full_mask = masking_info['full_mask'][i]
         partial_mask = masking_info['partial_mask'][i]
         
-        # Set fully masked patches to 0.5 (gray)
+        # For fully masked patches, set to gray (0.5)
         for idx in torch.where(full_mask)[0]:
             masked_patches[idx] = torch.ones_like(masked_patches[idx]) * 0.5
         
@@ -285,9 +198,31 @@ def visualize_reconstructions(model, dataloader, device, epoch, num_masks=None):
         images[f"masked_{i}"] = wandb.Image(masked, caption=f"Masked {i} ({num_masks} masks)")
         images[f"reconstructed_{i}"] = wandb.Image(reconstructed, caption=f"Reconstructed {i}")
     
-    # Generate 100% masked images
-    fully_generated = generate_complete_image(model, device, batch_size=batch_size)
-    for i in range(batch_size):
-        images[f"generated_{i}"] = wandb.Image(fully_generated[i].cpu(), caption=f"100% Masked Generation {i}")
+    # Generate images autoregressively (1 sample)
+    try:
+        generated_image = generate_image_autoregressively(model, device, temperature=1.0)
+        images["autoregressive_generation"] = wandb.Image(
+            generated_image.cpu(), 
+            caption="Autoregressive Generation"
+        )
+    except Exception as e:
+        print(f"Error generating autoregressive image: {e}")
+    
+    # Also generate images in parallel (non-autoregressive) if we're at high masking rates
+    if num_masks >= 128:
+        try:
+            patches_zero = torch.zeros((1, 256, 16), device=device)
+            mask_full = torch.ones((1, 256), dtype=torch.bool, device=device)
+            
+            with torch.no_grad():
+                outputs = model(patches_zero, mask_indices=mask_full)
+                parallel_gen = model.reconstruct_image(outputs['binary_prediction'][0]).cpu()
+                
+            images["parallel_generation"] = wandb.Image(
+                parallel_gen,
+                caption="Parallel (Non-autoregressive) Generation"
+            )
+        except Exception as e:
+            print(f"Error generating parallel image: {e}")
     
     return images
