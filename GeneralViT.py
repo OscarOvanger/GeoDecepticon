@@ -14,7 +14,8 @@ class VisionTransformer(nn.Module):
   def build_vocabulary(self, training_data, patch_size, full_mask=True, one_mask=True):
     self.patch_size = patch_size
     patch_dim = patch_size * patch_size
-        
+    img_size = training_data.shape[1]*training_data.shape[2]  # Assuming shape (batch, height, width)
+    num_patches = (img_size // patch_size) ** 2
     # Collect unique patches
     unique_patches = set()
     for img in training_data:
@@ -52,7 +53,7 @@ class VisionTransformer(nn.Module):
     self.vocab_size = len(self.vocab)
     self.embedding_projection = nn.Linear(patch_dim, self.hidden_dim)
     self.output_projection = nn.Linear(self.hidden_dim, self.vocab_size)
-    self.pos_embedding = nn.Parameter(torch.zeros(1, 196, self.hidden_dim))
+    self.pos_embedding = nn.Parameter(torch.zeros(1, num_patches, self.hidden_dim))
         
     return self.vocab
         
