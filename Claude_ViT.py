@@ -377,8 +377,8 @@ def calculate_accuracy(model, batch_patches, masked_patches, mask_indices, targe
     accuracy = correct / total if total > 0 else 0
     return accuracy, correct, total
 
-def create_visualization_grid(original_samples, masked_samples, reconstructed_samples, epoch, mask_ratio, loss):
-    """Create grid of images for visualization"""
+def create_reconstruction_grid(original_samples, masked_samples, reconstructed_samples, epoch, mask_ratio, loss):
+    """Create grid of images for visualization with better formatting"""
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
     
@@ -390,41 +390,26 @@ def create_visualization_grid(original_samples, masked_samples, reconstructed_sa
         # Plot original
         ax = fig.add_subplot(gs[i, 0])
         ax.imshow(original_samples[i].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-        ax.set_title(f"Original {i+1}")
+        ax.set_title(f"Original")
         ax.axis('off')
         
         # Plot masked
         ax = fig.add_subplot(gs[i, 1])
         ax.imshow(masked_samples[i].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-        ax.set_title(f"Masked {i+1}")
+        ax.set_title(f"Masked (ratio: {mask_ratio:.2f})")
         ax.axis('off')
         
         # Plot reconstructed
         ax = fig.add_subplot(gs[i, 2])
         ax.imshow(reconstructed_samples[i].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-        ax.set_title(f"Reconstructed {i+1}")
+        ax.set_title(f"Reconstructed")
         ax.axis('off')
     
     # Add epoch information
-    plt.suptitle(f"Epoch {epoch}, Mask Ratio: {mask_ratio:.2f}, Loss: {loss:.4f}", fontsize=16)
+    plt.suptitle(f"Epoch {epoch}, Loss: {loss:.4f}", fontsize=16)
     plt.tight_layout()
     
     return fig
-
-def get_mask_ratio_for_epoch(epoch, min_mask_ratio, max_mask_ratio, cycle_length=10):
-    """Get mask ratio for current epoch with cyclical schedule and noise"""
-    # Determine which cycle we're in
-    cycle = epoch // cycle_length
-    epoch_in_cycle = epoch % cycle_length
-    
-    # Linear increase within each cycle
-    base_ratio = min_mask_ratio + (max_mask_ratio - min_mask_ratio) * (epoch_in_cycle / (cycle_length - 1))
-    
-    # Add some noise for exploration (but keep within bounds)
-    noise = np.random.uniform(-0.05, 0.05)
-    mask_ratio = max(min_mask_ratio, min(max_mask_ratio, base_ratio + noise))
-    
-    return mask_ratio, cycle, epoch_in_cycle
 
 def train_vit_with_cyclical_masking(
     model, 
@@ -439,10 +424,10 @@ def train_vit_with_cyclical_masking(
     log_every=10,
     use_wandb=True,
     save_dir='./model_checkpoints',
-    visualize_every=10
+    visualize_every=5
 ):
     """
-    Training with cyclical mask ratio and comprehensive logging
+    Training with cyclical mask ratio and improved monitoring/visualization
     
     Args:
         model: The Vision Transformer model
@@ -463,6 +448,7 @@ def train_vit_with_cyclical_masking(
     
     # Create save directory if it doesn't exist
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(f"{save_dir}/reconstructions", exist_ok=True)
     
     # Select test samples for visualization
     test_indices = np.random.choice(len(training_data), 5, replace=False)
@@ -475,6 +461,11 @@ def train_vit_with_cyclical_masking(
         'mask_ratios': [],
     }
     
+    # Track all epoch metrics for better visualization
+    all_epoch_losses = []
+    all_epoch_accs = []
+    all_epoch_mask_ratios = []
+    
     # Overall training stats
     all_cycle_avg_losses = []
     all_cycle_avg_accs = []
@@ -486,13 +477,13 @@ def train_vit_with_cyclical_masking(
             epoch, min_mask_ratio, max_mask_ratio, cycle_length
         )
         
+        # Print using tqdm for better visibility
         print(f"Epoch {epoch+1}/{num_epochs}, Cycle {cycle+1}, Epoch in cycle {epoch_in_cycle+1}, Mask ratio: {mask_ratio:.3f}")
         
         model.train()
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
-        epoch_batch_losses = []
         
         # Extract image dimensions
         H, W = training_data.shape[1:]
@@ -503,100 +494,97 @@ def train_vit_with_cyclical_masking(
         # Create data loader
         num_batches = (len(training_data) + batch_size - 1) // batch_size
         
-        # Process in batches
-        batch_iterator = tqdm(range(num_batches), desc=f"Epoch {epoch+1}")
-        for batch_idx in batch_iterator:
-            # Get batch of images
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(training_data))
-            batch_size_actual = end_idx - start_idx
-            
-            # Get images for this batch
-            batch_images = training_data[start_idx:end_idx].to(device)
-            
-            # Extract patches
-            batch_patches = []
-            for img in batch_images:
-                img_patches = []
-                for i in range(0, H, model.patch_size):
-                    for j in range(0, W, model.patch_size):
-                        if i + model.patch_size <= H and j + model.patch_size <= W:
-                            patch = img[i:i+model.patch_size, j:j+model.patch_size].reshape(-1)
-                            img_patches.append(patch)
-                batch_patches.append(torch.stack(img_patches))
-            
-            batch_patches = torch.stack(batch_patches)
-            
-            # Create masked version with current mask ratio
-            masked_patches = batch_patches.clone()
-            mask_indices = []
-            
-            for b in range(batch_size_actual):
-                # Random indices to mask
-                num_to_mask = int(patches_per_image * mask_ratio)
-                indices = torch.randperm(patches_per_image)[:num_to_mask]
-                mask_indices.append(indices)
+        # Process in batches with progress bar
+        with tqdm(total=num_batches, desc=f"Training Epoch {epoch+1}/{num_epochs}", 
+                 postfix={'loss': 0.0, 'acc': 0.0}, leave=True) as batch_pbar:
+            for batch_idx in range(num_batches):
+                # Get batch of images
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(training_data))
+                batch_size_actual = end_idx - start_idx
                 
-                for idx in indices:
-                    r = torch.rand(1).item()
-                    if r < 0.2:  # 20% fully masked
-                        masked_patches[b, idx] = 0.5
-                    elif r < 0.4:  # 20% partially masked
-                        pos = torch.randint(0, model.patch_size**2, (1,)).item()
-                        val = batch_patches[b, idx, pos].item()
-                        masked_patches[b, idx] = 0.5
-                        masked_patches[b, idx, pos] = val
-                    # 60% unchanged for faster learning
-            
-            # Compute targets - find the corresponding vocabulary token
-            targets = torch.zeros(batch_size_actual, patches_per_image, dtype=torch.long, device=device)
-            for b in range(batch_size_actual):
-                for p in range(patches_per_image):
-                    targets[b, p] = model._find_closest_token(batch_patches[b, p])
-            
-            # Forward pass
-            optimizer.zero_grad()
-            logits, _ = model(masked_patches)
-            
-            # Calculate loss
-            loss = criterion(logits.reshape(-1, model.vocab_size), targets.reshape(-1))
-            
-            # Backward and optimize
-            loss.backward()
-            
-            # Clip gradients to prevent instability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            optimizer.step()
-            
-            # Calculate accuracy on masked tokens
-            batch_acc, correct, total = calculate_accuracy(
-                model, batch_patches, masked_patches, mask_indices, targets
-            )
-            
-            # Update metrics
-            epoch_loss += loss.item() * batch_size_actual
-            epoch_correct += correct
-            epoch_total += total
-            epoch_batch_losses.append(loss.item())
-            
-            # Update progress bar
-            batch_iterator.set_postfix({
-                'loss': loss.item(), 
-                'acc': batch_acc, 
-                'mask_ratio': mask_ratio
-            })
-            
-            # Log to W&B
-            if use_wandb and batch_idx % log_every == 0:
-                wandb.log({
-                    'batch': batch_idx + epoch * num_batches,
-                    'batch_loss': loss.item(),
-                    'batch_accuracy': batch_acc,
-                    'mask_ratio': mask_ratio,
-                    'cycle': cycle,
-                    'epoch_in_cycle': epoch_in_cycle
+                # Get images for this batch
+                batch_images = training_data[start_idx:end_idx].to(device)
+                
+                # Extract patches
+                batch_patches = []
+                for img in batch_images:
+                    img_patches = []
+                    for i in range(0, H, model.patch_size):
+                        for j in range(0, W, model.patch_size):
+                            if i + model.patch_size <= H and j + model.patch_size <= W:
+                                patch = img[i:i+model.patch_size, j:j+model.patch_size].reshape(-1)
+                                img_patches.append(patch)
+                    batch_patches.append(torch.stack(img_patches))
+                
+                batch_patches = torch.stack(batch_patches)
+                
+                # Create masked version with current mask ratio
+                masked_patches = batch_patches.clone()
+                mask_indices = []
+                
+                for b in range(batch_size_actual):
+                    # Random indices to mask
+                    num_to_mask = int(patches_per_image * mask_ratio)
+                    indices = torch.randperm(patches_per_image)[:num_to_mask]
+                    mask_indices.append(indices)
+                    
+                    for idx in indices:
+                        r = torch.rand(1).item()
+                        if r < 0.2:  # 20% fully masked
+                            masked_patches[b, idx] = 0.5
+                        elif r < 0.4:  # 20% partially masked
+                            pos = torch.randint(0, model.patch_size**2, (1,)).item()
+                            val = batch_patches[b, idx, pos].item()
+                            masked_patches[b, idx] = 0.5
+                            masked_patches[b, idx, pos] = val
+                        # 60% unchanged for faster learning
+                
+                # Compute targets - find the corresponding vocabulary token
+                targets = torch.zeros(batch_size_actual, patches_per_image, dtype=torch.long, device=device)
+                for b in range(batch_size_actual):
+                    for p in range(patches_per_image):
+                        targets[b, p] = model._find_closest_token(batch_patches[b, p])
+                
+                # Forward pass
+                optimizer.zero_grad()
+                logits, _ = model(masked_patches)
+                
+                # Calculate loss
+                loss = criterion(logits.reshape(-1, model.vocab_size), targets.reshape(-1))
+                
+                # Backward and optimize
+                loss.backward()
+                
+                # Clip gradients to prevent instability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                optimizer.step()
+                
+                # Calculate accuracy on masked tokens
+                batch_acc, correct, total = calculate_accuracy(
+                    model, batch_patches, masked_patches, mask_indices, targets
+                )
+                
+                # Update metrics
+                epoch_loss += loss.item() * batch_size_actual
+                epoch_correct += correct
+                epoch_total += total
+                
+                # Update progress bar
+                batch_pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}", 
+                    'acc': f"{batch_acc:.4f}"
                 })
+                batch_pbar.update(1)
+                
+                # Log to W&B - only log key metrics
+                if use_wandb and batch_idx % log_every == 0:
+                    wandb.log({
+                        'batch_loss': loss.item(),
+                        'batch_accuracy': batch_acc,
+                        'mask_ratio': mask_ratio,
+                    })
         
         # Calculate epoch metrics
         avg_loss = epoch_loss / len(training_data)
@@ -607,22 +595,24 @@ def train_vit_with_cyclical_masking(
         cycle_metrics['accuracies'].append(avg_acc)
         cycle_metrics['mask_ratios'].append(mask_ratio)
         
+        # Store for overall plots
+        all_epoch_losses.append(avg_loss)
+        all_epoch_accs.append(avg_acc)
+        all_epoch_mask_ratios.append(mask_ratio)
+        
         # Print epoch results
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f}, Mask Ratio: {mask_ratio:.3f}")
         
-        # Log epoch metrics to W&B
+        # Log epoch metrics to W&B - keep it focused on useful metrics
         if use_wandb:
             wandb.log({
                 'epoch': epoch,
                 'epoch_loss': avg_loss,
                 'epoch_accuracy': avg_acc,
-                'mask_ratio': mask_ratio,
-                'cycle': cycle,
-                'epoch_in_cycle': epoch_in_cycle
             })
         
         # If this is the end of a cycle, calculate and log cycle metrics
-        if (epoch + 1) % cycle_length == 0:
+        if (epoch + 1) % cycle_length == 0 or (epoch + 1) == num_epochs:
             cycle_avg_loss = np.mean(cycle_metrics['losses'])
             cycle_avg_acc = np.mean(cycle_metrics['accuracies'])
             
@@ -632,13 +622,70 @@ def train_vit_with_cyclical_masking(
             
             print(f"Cycle {cycle+1} completed, Avg Loss: {cycle_avg_loss:.4f}, Avg Acc: {cycle_avg_acc:.4f}")
             
-            # Log cycle metrics to W&B
+            # Create and log cycle metrics plot
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            
+            # Plot epoch losses for this cycle
+            axes[0].plot(range(epoch - len(cycle_metrics['losses']) + 1, epoch + 1), cycle_metrics['losses'], 'r-o')
+            axes[0].set_xlabel('Epoch')
+            axes[0].set_ylabel('Loss')
+            axes[0].set_title(f'Cycle {cycle+1} Losses')
+            axes[0].grid(True)
+            
+            # Plot epoch accuracies for this cycle
+            axes[1].plot(range(epoch - len(cycle_metrics['accuracies']) + 1, epoch + 1), cycle_metrics['accuracies'], 'b-o')
+            axes[1].set_xlabel('Epoch')
+            axes[1].set_ylabel('Accuracy')
+            axes[1].set_title(f'Cycle {cycle+1} Accuracies')
+            axes[1].grid(True)
+            
+            # Plot mask ratios for this cycle
+            axes[2].plot(range(epoch - len(cycle_metrics['mask_ratios']) + 1, epoch + 1), cycle_metrics['mask_ratios'], 'g-o')
+            axes[2].set_xlabel('Epoch')
+            axes[2].set_ylabel('Mask Ratio')
+            axes[2].set_title(f'Cycle {cycle+1} Mask Ratios')
+            axes[2].grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/cycle_{cycle+1}_metrics.png")
+            
             if use_wandb:
                 wandb.log({
                     'cycle_completed': cycle + 1,
                     'cycle_avg_loss': cycle_avg_loss,
-                    'cycle_avg_accuracy': cycle_avg_acc
+                    'cycle_avg_accuracy': cycle_avg_acc,
+                    'cycle_metrics': wandb.Image(fig)
                 })
+            
+            plt.close(fig)
+            
+            # Plot overall cycle metrics
+            if len(all_cycle_avg_losses) > 1:
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                
+                # Plot cycle average losses
+                axes[0].plot(range(1, len(all_cycle_avg_losses) + 1), all_cycle_avg_losses, 'r-o')
+                axes[0].set_xlabel('Cycle')
+                axes[0].set_ylabel('Average Loss')
+                axes[0].set_title('Cycle Average Losses')
+                axes[0].grid(True)
+                
+                # Plot cycle average accuracies
+                axes[1].plot(range(1, len(all_cycle_avg_accs) + 1), all_cycle_avg_accs, 'b-o')
+                axes[1].set_xlabel('Cycle')
+                axes[1].set_ylabel('Average Accuracy')
+                axes[1].set_title('Cycle Average Accuracies')
+                axes[1].grid(True)
+                
+                plt.tight_layout()
+                plt.savefig(f"{save_dir}/overall_cycle_metrics.png")
+                
+                if use_wandb:
+                    wandb.log({
+                        'overall_cycle_metrics': wandb.Image(fig)
+                    })
+                
+                plt.close(fig)
             
             # Save model checkpoint at end of cycle
             torch.save({
@@ -696,7 +743,7 @@ def train_vit_with_cyclical_masking(
                     reconstructed_test_samples.append(reconstructed)
                 
                 # Create visualization grid
-                fig = create_visualization_grid(
+                fig = create_reconstruction_grid(
                     test_samples, 
                     masked_test_samples, 
                     reconstructed_test_samples, 
@@ -705,12 +752,60 @@ def train_vit_with_cyclical_masking(
                     avg_loss
                 )
                 
+                # Save the reconstruction grid locally by epoch number
+                plt.savefig(f"{save_dir}/reconstructions/epoch_{epoch+1}.png")
+                
                 # Log visualization to W&B
                 if use_wandb:
-                    wandb.log({"reconstruction_grid": wandb.Image(fig)})
+                    wandb.log({
+                        "reconstruction_grid": wandb.Image(fig),
+                        "epoch": epoch + 1
+                    })
                 
                 # Close figure to free memory
                 plt.close(fig)
+    
+    # Plot final overall metrics
+    if len(all_epoch_losses) > 0:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # Plot all epoch losses
+        axes[0, 0].plot(range(1, len(all_epoch_losses) + 1), all_epoch_losses, 'r-')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Epoch Losses')
+        axes[0, 0].grid(True)
+        
+        # Plot all epoch accuracies
+        axes[0, 1].plot(range(1, len(all_epoch_accs) + 1), all_epoch_accs, 'b-')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Accuracy')
+        axes[0, 1].set_title('Epoch Accuracies')
+        axes[0, 1].grid(True)
+        
+        # Plot all mask ratios
+        axes[1, 0].plot(range(1, len(all_epoch_mask_ratios) + 1), all_epoch_mask_ratios, 'g-')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Mask Ratio')
+        axes[1, 0].set_title('Mask Ratios')
+        axes[1, 0].grid(True)
+        
+        # Plot cycle average losses
+        axes[1, 1].plot(range(1, len(all_cycle_avg_losses) + 1), all_cycle_avg_losses, 'm-o')
+        axes[1, 1].set_xlabel('Cycle')
+        axes[1, 1].set_ylabel('Average Loss')
+        axes[1, 1].set_title('Cycle Average Losses')
+        axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/final_metrics.png")
+        
+        if use_wandb:
+            wandb.log({
+                'final_metrics': wandb.Image(fig)
+            })
+        
+        plt.close(fig)
     
     # Save final model
     torch.save({
@@ -721,13 +816,134 @@ def train_vit_with_cyclical_masking(
         'final_acc': avg_acc
     }, f"{save_dir}/model_final.pt")
     
+    # Create a small helper HTML file to view reconstructions across epochs
+    create_reconstruction_viewer(save_dir, visualize_every, num_epochs)
+    
     return model, {
         'cycle_avg_losses': all_cycle_avg_losses,
-        'cycle_avg_accs': all_cycle_avg_accs
+        'cycle_avg_accs': all_cycle_avg_accs,
+        'all_epoch_losses': all_epoch_losses,
+        'all_epoch_accs': all_epoch_accs
     }
 
+def create_reconstruction_viewer(save_dir, visualize_every, num_epochs):
+    """Create a simple HTML file to view reconstructions across epochs"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Vision Transformer Reconstructions Viewer</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            .controls { margin-bottom: 20px; }
+            .image-container { text-align: center; }
+            button { padding: 8px 16px; margin: 0 5px; }
+            select { padding: 8px; }
+        </style>
+    </head>
+    <body>
+        <h1>Vision Transformer Reconstructions Viewer</h1>
+        <div class="controls">
+            <button id="prev">Previous</button>
+            <select id="epochSelect"></select>
+            <button id="next">Next</button>
+        </div>
+        <div class="image-container">
+            <img id="reconstructionImage" style="max-width: 100%;">
+        </div>
+        
+        <script>
+            // List of available epochs
+            const epochs = [];
+            const visualizeEvery = VISUALIZE_EVERY;
+            const numEpochs = NUM_EPOCHS;
+            
+            // Populate epochs array
+            for (let i = 0; i <= numEpochs; i += visualizeEvery) {
+                epochs.push(i + 1);
+            }
+            if (epochs[epochs.length - 1] !== numEpochs) {
+                epochs.push(numEpochs);
+            }
+            
+            // Populate select element
+            const select = document.getElementById('epochSelect');
+            for (const epoch of epochs) {
+                const option = document.createElement('option');
+                option.value = epoch;
+                option.textContent = `Epoch ${epoch}`;
+                select.appendChild(option);
+            }
+            
+            // Set initial image
+            let currentIndex = 0;
+            updateImage();
+            
+            // Event listeners
+            document.getElementById('prev').addEventListener('click', () => {
+                if (currentIndex > 0) {
+                    currentIndex--;
+                    select.selectedIndex = currentIndex;
+                    updateImage();
+                }
+            });
+            
+            document.getElementById('next').addEventListener('click', () => {
+                if (currentIndex < epochs.length - 1) {
+                    currentIndex++;
+                    select.selectedIndex = currentIndex;
+                    updateImage();
+                }
+            });
+            
+            select.addEventListener('change', () => {
+                currentIndex = select.selectedIndex;
+                updateImage();
+            });
+            
+            function updateImage() {
+                const epoch = epochs[currentIndex];
+                document.getElementById('reconstructionImage').src = `reconstructions/epoch_${epoch}.png`;
+            }
+        </script>
+    </body>
+    </html>
+    """.replace('VISUALIZE_EVERY', str(visualize_every)).replace('NUM_EPOCHS', str(num_epochs))
+    
+    with open(f"{save_dir}/view_reconstructions.html", 'w') as f:
+        f.write(html_content)
+    
+    print(f"Created reconstruction viewer at {save_dir}/view_reconstructions.html")
 
-# Main pipeline
+# Define a custom WandB callback to configure what to log
+def setup_wandb_logging(project_name="vit-discrete-tokens", run_name=None, config=None, log_model=True):
+    """Setup WandB with custom configuration to focus on the most important metrics"""
+    if run_name is None:
+        run_name = f"vit_{time.strftime('%Y%m%d_%H%M%S')}"
+    
+    # Initialize WandB with focused logging
+    run = wandb.init(
+        project=project_name,
+        name=run_name,
+        config=config,
+        settings=wandb.Settings(
+            # Customize what gets logged to WandB
+            log_model=log_model,
+            silent="warning"  # Reduce WandB logging noise
+        )
+    )
+    
+    # Define what metrics to log in WandB
+    wandb.define_metric("batch_loss", summary="min")
+    wandb.define_metric("batch_accuracy", summary="max")
+    wandb.define_metric("epoch_loss", summary="min")
+    wandb.define_metric("epoch_accuracy", summary="max")
+    wandb.define_metric("cycle_avg_loss", summary="min")
+    wandb.define_metric("cycle_avg_accuracy", summary="max")
+    
+    return run
+
+# Main pipeline with improvements
 def run_vit_training_pipeline(
     data_array,
     patch_size=3,
@@ -747,10 +963,11 @@ def run_vit_training_pipeline(
     wandb_name=None,
     save_dir='./model_checkpoints',
     test_split=0.1,  # Proportion of data to use for testing
+    visualize_every=5,
     seed=42
 ):
     """
-    Complete pipeline for training Vision Transformer with discrete tokens
+    Complete pipeline for training Vision Transformer with discrete tokens - improved monitoring
     
     Args:
         data_array: Numpy array or Torch tensor of shape (N, H, W)
@@ -771,36 +988,34 @@ def run_vit_training_pipeline(
         wandb_name: W&B run name
         save_dir: Directory to save model checkpoints
         test_split: Proportion of data to use for testing
+        visualize_every: How often to create visualizations (epochs)
         seed: Random seed
     """
     # Set random seed for reproducibility
     set_seed(seed)
     
-    # Initialize W&B
+    # Initialize W&B with focused logging
     if use_wandb:
-        run_name = wandb_name or f"vit_p{patch_size}_h{hidden_dim}_l{num_layers}_{time.strftime('%Y%m%d_%H%M%S')}"
-        wandb.init(
-            project=wandb_project,
-            name=run_name,
-            config={
-                "patch_size": patch_size,
-                "hidden_dim": hidden_dim,
-                "num_heads": num_heads,
-                "num_layers": num_layers,
-                "ffn_dim": ffn_dim,
-                "dropout": dropout,
-                "batch_size": batch_size,
-                "learning_rate": learning_rate,
-                "num_epochs": num_epochs,
-                "min_mask_ratio": min_mask_ratio,
-                "max_mask_ratio": max_mask_ratio,
-                "cycle_length": cycle_length,
-                "architecture": "VisionTransformer_DiscreteTokens"
-            }
-        )
+        config = {
+            "patch_size": patch_size,
+            "hidden_dim": hidden_dim,
+            "num_heads": num_heads,
+            "num_layers": num_layers,
+            "ffn_dim": ffn_dim,
+            "dropout": dropout,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "num_epochs": num_epochs,
+            "min_mask_ratio": min_mask_ratio,
+            "max_mask_ratio": max_mask_ratio,
+            "cycle_length": cycle_length,
+            "architecture": "VisionTransformer_DiscreteTokens"
+        }
+        setup_wandb_logging(wandb_project, wandb_name, config)
     
     # Create output directories
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(f"{save_dir}/reconstructions", exist_ok=True)
     
     # Process the input array
     print("Processing input data...")
@@ -877,17 +1092,11 @@ def run_vit_training_pipeline(
     # Move model to device
     model = model.to(device)
     
-    # Log vocabulary sample to W&B
-    if use_wandb:
-        vocab_fig = visualize_vocabulary(model, num_tokens=10)
-        wandb.log({"vocabulary_sample": wandb.Image(vocab_fig)})
-        plt.close(vocab_fig)
-    
     # Setup optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
     
-    # Train the model
+    # Train the model with improved monitoring
     print("Starting training...")
     trained_model, metrics = train_vit_with_cyclical_masking(
         model=model,
@@ -900,32 +1109,9 @@ def run_vit_training_pipeline(
         max_mask_ratio=max_mask_ratio,
         cycle_length=cycle_length,
         use_wandb=use_wandb,
-        save_dir=save_dir
+        save_dir=save_dir,
+        visualize_every=visualize_every
     )
-    
-    # Plot final cycle metrics
-    plt.figure(figsize=(12, 6))
-    plt.subplot(1, 2, 1)
-    plt.plot(metrics['cycle_avg_losses'], 'r-o')
-    plt.xlabel('Cycle')
-    plt.ylabel('Average Loss')
-    plt.title('Cycle Average Loss')
-    plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(metrics['cycle_avg_accs'], 'b-o')
-    plt.xlabel('Cycle')
-    plt.ylabel('Average Accuracy')
-    plt.title('Cycle Average Accuracy')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(f"{save_dir}/cycle_metrics.png")
-    
-    if use_wandb:
-        wandb.log({"cycle_metrics": wandb.Image(plt)})
-    
-    plt.close()
     
     # Final evaluation on test set
     print("Evaluating on test set...")
@@ -943,6 +1129,8 @@ def run_vit_training_pipeline(
         wandb.log({"final_test_accuracy": test_accuracy})
         wandb.finish()
     
+    print(f"Training complete! Reconstructions viewer available at: {save_dir}/view_reconstructions.html")
+    
     return trained_model, metrics, test_accuracy
 
 def evaluate_model(model, test_data, mask_ratio=0.3, patch_size=None, device=None):
@@ -957,7 +1145,7 @@ def evaluate_model(model, test_data, mask_ratio=0.3, patch_size=None, device=Non
     correct = 0
     total = 0
     
-    with torch.no_grad():
+    with torch.no_grad(), tqdm(total=len(test_data), desc="Evaluating") as eval_pbar:
         for i in range(len(test_data)):
             sample = test_data[i].to(device)
             
@@ -1019,62 +1207,10 @@ def evaluate_model(model, test_data, mask_ratio=0.3, patch_size=None, device=Non
                 
                 if predictions[idx] == target_idx:
                     correct += 1
+            
+            eval_pbar.update(1)
     
     accuracy = correct / total if total > 0 else 0
     return accuracy
 
-# Example usage
-"""
-if __name__ == "__main__":
-    # Parse command line arguments
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Train Vision Transformer with Discrete Tokens')
-    parser.add_argument('--data_path', type=str, required=True, help='Path to data file')
-    parser.add_argument('--patch_size', type=int, default=3, help='Patch size')
-    parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension')
-    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--num_layers', type=int, default=6, help='Number of transformer layers')
-    parser.add_argument('--ffn_dim', type=int, default=512, help='FFN dimension')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--min_mask_ratio', type=float, default=0.05, help='Minimum mask ratio')
-    parser.add_argument('--max_mask_ratio', type=float, default=0.5, help='Maximum mask ratio')
-    parser.add_argument('--cycle_length', type=int, default=10, help='Cycle length in epochs')
-    parser.add_argument('--wandb_project', type=str, default='vit-discrete-tokens', help='W&B project name')
-    parser.add_argument('--wandb_name', type=str, default=None, help='W&B run name')
-    parser.add_argument('--save_dir', type=str, default='./model_checkpoints', help='Save directory')
-    parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples')
-    parser.add_argument('--crop_h', type=int, default=60, help='Crop height')
-    parser.add_argument('--crop_w', type=int, default=60, help='Crop width')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--no_wandb', action='store_true', help='Disable W&B logging')
-    
-    args = parser.parse_args()
-    
-    # Run training pipeline
-    model, metrics = run_vit_training_pipeline(
-        data_path=args.data_path,
-        patch_size=args.patch_size,
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        ffn_dim=args.ffn_dim,
-        dropout=args.dropout,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        learning_rate=args.learning_rate,
-        min_mask_ratio=args.min_mask_ratio,
-        max_mask_ratio=args.max_mask_ratio,
-        cycle_length=args.cycle_length,
-        use_wandb=not args.no_wandb,
-        wandb_project=args.wandb_project,
-        wandb_name=args.wandb_name,
-        save_dir=args.save_dir,
-        max_samples=args.max_samples,
-        crop_size=(args.crop_h, args.crop_w),
-        seed=args.seed
-    )
-"""
+
