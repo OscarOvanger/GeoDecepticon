@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import os
 import wandb
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import random
 import time
 
