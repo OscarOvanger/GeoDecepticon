@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import time
 
 def set_seed(seed=42):
     """Set random seeds for reproducibility"""
