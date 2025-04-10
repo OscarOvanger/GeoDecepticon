@@ -576,8 +576,9 @@ def train_vit(model, train_data, test_data=None, batch_size=32, num_epochs=100,
                     plt.tight_layout()
                     if use_wandb:
                         wandb.log({f"reconstruction_{i}": wandb.Image(fig)})
+                    plt.show()
                     plt.close(fig)
-                
+                    
                 if (epoch + 1) % cycle_length == 0 or (epoch + 1) == num_epochs:
                     num_conditions = 30
                     condition_indices = np.random.choice(image_size * image_size, num_conditions, replace=False)
@@ -593,6 +594,7 @@ def train_vit(model, train_data, test_data=None, batch_size=32, num_epochs=100,
                     ax.axis('off')
                     if use_wandb:
                         wandb.log({"conditional_sample": wandb.Image(fig)})
+                    plt.show()
                     plt.close(fig)
             
             torch.save(model.state_dict(), f"{save_dir}/vit_patch{model.patch_size}_epoch{epoch+1}.pt")
