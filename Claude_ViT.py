@@ -2,20 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import wandb
+#import wandb
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import random
 import time
 
-def set_seed(seed=42):
-    """Set random seeds for reproducibility"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
 
 ########################################
 # Helper: Convert Patches to Integer Code
@@ -362,7 +355,7 @@ def test_reconstruction(model, original_sample, masked_sample):
         j = (idx % n_w) * patch_size
         
         # Get the token from vocabulary
-        token = model.vocab[token_indices[idx]].reshape(patch_size, patch_size)
+        token = model.vocab[token_indices[0][idx]].reshape(patch_size, patch_size)
         reconstructed[i:i+patch_size, j:j+patch_size] = token
     
     return reconstructed
@@ -710,7 +703,6 @@ def run_training(data_array, patch_size=3, hidden_dim=128, num_heads=8, num_laye
                 save_dir='./checkpoints', test_split=0.1, seed=42):
     """Complete pipeline for training Vision Transformer with discrete tokens"""
     # Set random seed
-    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Process data
@@ -791,46 +783,3 @@ def run_training(data_array, patch_size=3, hidden_dim=128, num_heads=8, num_laye
         wandb.finish()
     
     return model
-
-########################################
-# Example Usage
-########################################
-
-# Example:
-# import numpy as np
-# import torch
-# import wandb
-#
-# # Load your binary image data
-# # data_array shape should be [N, H, W] where N is number of images
-# # and H, W are height and width
-# data_array = np.load("your_data.npy")
-# 
-# # Convert to torch tensor if needed
-# training_data = torch.tensor(data_array, dtype=torch.float32)
-#
-# # Optional: login to wandb
-# wandb.login()
-#
-# # Train the model
-# model = run_training(
-#     training_data,
-#     patch_size=3,           # Size of image patches (3x3)
-#     hidden_dim=128,         # Hidden dimension for transformer
-#     num_heads=8,            # Number of attention heads
-#     num_layers=6,           # Number of transformer layers
-#     ffn_dim=512,            # Feedforward network dimension
-#     dropout=0.1,            # Dropout rate
-#     batch_size=32,          # Batch size
-#     num_epochs=100,         # Number of training epochs
-#     min_mask_ratio=0.05,    # Minimum masking ratio
-#     max_mask_ratio=0.5,     # Maximum masking ratio
-#     cycle_length=10,        # Length of masking cycle (epochs)
-#     use_wandb=True,         # Whether to use wandb
-#     wandb_project="my-vit-project",  # Wandb project name
-#     save_dir='./checkpoints'  # Directory to save checkpoints
-# )
-#
-# # You can now use the model for reconstruction or conditional generation:
-
-
