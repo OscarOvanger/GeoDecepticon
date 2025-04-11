@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-#import wandb
-from tqdm import tqdm
+#from tqdm import tqdm  # you can uncomment if desired
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -87,45 +86,28 @@ def build_vocabulary(training_data, patch_size, partial_masked_token=True):
     return vocab, fully_masked_idx, partial_token_indices, masked_token_param, partial_masked_token_params
 
 ########################################
-# Relative Position Self-Attention
+# Relative Position Self-Attention (Modified)
 ########################################
 
 class RelativePositionSelfAttention(nn.Module):
-    """Self-attention with relative positional encoding"""
-    def __init__(self, hidden_dim, num_heads, max_rel_dist=32, dropout=0.1):
+    """Self-attention with learnable relative positional encoding.
+       Here we create a parameter of shape (max_seq_len, max_seq_len) which is sliced
+       to the current sequence length and passed as an attn_mask (added to Q*K^T)."""
+    def __init__(self, hidden_dim, num_heads, max_seq_len=256, dropout=0.1):
         super().__init__()
         self.mha = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.max_rel_dist = max_rel_dist
-        
-        # Relative position bias table
-        self.rel_pos_bias = nn.Parameter(torch.zeros(2 * max_rel_dist + 1, num_heads))
-        nn.init.normal_(self.rel_pos_bias, std=0.02)
+        self.max_seq_len = max_seq_len
+        # Create a learnable matrix of shape (max_seq_len, max_seq_len)
+        self.rel_pos_encoding = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
+        nn.init.normal_(self.rel_pos_encoding, std=0.02)
     
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
-        
-        # Generate relative position bias
-        rel_pos_idx = self._get_rel_pos_idx(seq_len).to(x.device)  # (seq_len, seq_len)
-        rel_pos_bias = self.rel_pos_bias[rel_pos_idx]  # (seq_len, seq_len, num_heads)
-        rel_pos_bias = rel_pos_bias.permute(2, 0, 1)  # (num_heads, seq_len, seq_len)
-        
-        # Create an aggregate attention mask from biases over heads.
-        attn_mask = torch.zeros(seq_len, seq_len, device=x.device)
-        for h in range(rel_pos_bias.size(0)):
-            attn_mask += rel_pos_bias[h]
-        attn_mask = attn_mask / rel_pos_bias.size(0)
-        
+        # Slice the relative positional encoding to current sequence length.
+        attn_mask = self.rel_pos_encoding[:seq_len, :seq_len]
+        # Pass attn_mask to the MHA layer (it will be added to Q*K^T)
         output, _ = self.mha(x, x, x, attn_mask=attn_mask)
-        
         return output
-    
-    def _get_rel_pos_idx(self, seq_len):
-        """Generate relative position indices"""
-        i = torch.arange(seq_len).unsqueeze(1)
-        j = torch.arange(seq_len).unsqueeze(0)
-        rel_pos = i - j
-        rel_pos = torch.clamp(rel_pos, -self.max_rel_dist, self.max_rel_dist) + self.max_rel_dist
-        return rel_pos
 
 ########################################
 # Transformer Encoder Layer
@@ -133,10 +115,10 @@ class RelativePositionSelfAttention(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with relative positional encoding"""
-    def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.1, max_rel_dist=32):
+    def __init__(self, hidden_dim, num_heads, ffn_dim, dropout=0.1, max_seq_len=256):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.attn = RelativePositionSelfAttention(hidden_dim, num_heads, max_rel_dist, dropout)
+        self.attn = RelativePositionSelfAttention(hidden_dim, num_heads, max_seq_len, dropout)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, ffn_dim),
@@ -161,7 +143,7 @@ class VisionTransformer(nn.Module):
     """Vision Transformer with discrete token vocabulary and relative positional encoding"""
     def __init__(self, vocab, fully_masked_idx, partial_token_indices, 
                  masked_token_param, partial_masked_token_params, patch_size, 
-                 num_heads, num_layers, ffn_dim, hidden_dim, max_rel_dist=32, dropout=0.1):
+                 num_heads, num_layers, ffn_dim, hidden_dim, max_seq_len=256, dropout=0.1):
         super().__init__()
         # Store vocabulary and token parameters
         self.register_buffer('vocab', vocab)
@@ -182,7 +164,7 @@ class VisionTransformer(nn.Module):
         
         # Transformer encoder
         self.transformer = nn.Sequential(*[
-            TransformerEncoderLayer(hidden_dim, num_heads, ffn_dim, dropout, max_rel_dist)
+            TransformerEncoderLayer(hidden_dim, num_heads, ffn_dim, dropout, max_seq_len)
             for _ in range(num_layers)
         ])
         
@@ -365,305 +347,36 @@ def test_reconstruction(model, original_sample, masked_sample):
     return reconstructed
 
 ########################################
-# Image Generation (Conditional)
+# Test Script for Isolating Inner Workings
 ########################################
 
-def sample_image_conditional(model, patch_size, image_size, temperature=1.0,
-                              condition_indices=None, condition_values=None):
-    """
-    Generate one image using the model while enforcing conditions.
-    Instead of a fixed raster-scan order, this function first generates the patches
-    that contain condition values and then fills in the rest.
-    """
-    device = next(model.parameters()).device
-    grid_size = image_size // patch_size
-    num_patches = grid_size ** 2
-    patch_dim = patch_size * patch_size
-
-    # Build patch-level conditions dictionary.
-    patch_conditions = {}
-    if condition_indices is not None and condition_values is not None:
-        for cond_idx, cond_val in zip(condition_indices, condition_values):
-            global_row = int(cond_idx) // image_size
-            global_col = int(cond_idx) % image_size
-            patch_row = global_row // patch_size
-            patch_col = global_col // patch_size
-            patch_index = patch_row * grid_size + patch_col
-            local_row = global_row % patch_size
-            local_col = global_col % patch_size
-            local_index = local_row * patch_size + local_col
-            if patch_index not in patch_conditions:
-                patch_conditions[patch_index] = {}
-            patch_conditions[patch_index][local_index] = float(cond_val)
-
-    # Determine generation order.
-    def patch_coords(i):
-        return (i // grid_size, i % grid_size)
-    conditioned_indices = set(patch_conditions.keys())
-    conditioned_list = sorted(list(conditioned_indices))
-    remaining = [i for i in range(num_patches) if i not in conditioned_indices]
-    def min_distance(i):
-        r_i, c_i = patch_coords(i)
-        return min(abs(r_i - patch_coords(j)[0]) + abs(c_i - patch_coords(j)[1])
-                   for j in conditioned_indices) if conditioned_indices else 0
-    remaining = sorted(remaining, key=min_distance)
-    order_list = conditioned_list + remaining
-
-    generated = model.mask_token.detach().clone().unsqueeze(0).repeat(num_patches, 1)
-    log_likelihood = 0.0
-    generated = generated.unsqueeze(0)  # shape: (1, num_patches, patch_dim)
-
-    for idx in order_list:
-        cond = patch_conditions.get(idx, None)
-        logits = model(generated)  # shape: (1, num_patches, vocab_size)
-        logits_i = logits[0, idx] / temperature
-        if cond is not None:
-            candidate_mask = torch.ones(model.vocab_size, dtype=torch.bool, device=logits_i.device)
-            for local_idx, cond_val in cond.items():
-                candidate_mask = candidate_mask & (model.vocab[:, local_idx] == cond_val)
-            logits_i = logits_i.masked_fill(~candidate_mask, -1e9)
-        probs = torch.softmax(logits_i, dim=-1)
-        token = torch.multinomial(probs, num_samples=1)
-        log_prob = torch.log(probs[token] + 1e-10)
-        log_likelihood += log_prob.item()
-        patch = model.vocab[token]
-        generated[0, idx] = patch
-
-    return generated, log_likelihood
-
-########################################
-# Training Function
-########################################
-
-def train_vit(model, train_data, test_data=None, batch_size=32, num_epochs=100, 
-              min_mask_ratio=0.05, max_mask_ratio=0.5, cycle_length=10, 
-              use_wandb=True, save_dir='./checkpoints', visualize_every=10):
-    """Train Vision Transformer with cyclical mask ratio (with vectorized target computation)."""
-    device = next(model.parameters()).device
-    image_size = train_data.shape[1]
-    import os
-    os.makedirs(save_dir, exist_ok=True)
+if __name__ == '__main__':
+    # Set a random seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
     
-    # Select some test samples.
-    if test_data is None:
-        test_data = train_data
-    test_indices = np.random.choice(len(test_data), min(3, len(test_data)), replace=False)
-    test_samples = test_data[test_indices].to(device)
+    # Create a dummy binary image (e.g., 12x12 image for patch_size=3 -> 16 patches)
+    H, W = 12, 12
+    patch_size = 3
+    # Create a simple pattern (for clarity, you can also use random)
+    dummy_image = np.random.randint(0, 2, (H, W)).astype(np.float32)
+    print("Original Image:\n", dummy_image)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
+    # Convert to torch tensor
+    dummy_image_tensor = torch.tensor(dummy_image)
+    dummy_image_tensor = dummy_image_tensor.unsqueeze(0)  # shape: (1, H, W)
     
-    dataset = BinaryImageDataset(train_data)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    cycle_losses = []
-    cycle_accs = []
-    
-    for epoch in range(num_epochs):
-        cycle = epoch // cycle_length
-        epoch_in_cycle = epoch % cycle_length
-        ratio_range = max_mask_ratio - min_mask_ratio
-        mask_ratio = min_mask_ratio + ratio_range * (epoch_in_cycle / (cycle_length - 1))
-        mask_ratio = np.clip(mask_ratio + np.random.uniform(-0.05, 0.05), min_mask_ratio, max_mask_ratio)
-        
-        model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for batch in pbar:
-                batch = batch.to(device)
-                B = batch.shape[0]
-                patches = BinaryImageDataset.batch_to_patches(batch, model.patch_size)
-                num_patches = patches.shape[1]
-                patch_dim = patches.shape[2]
-                
-                mask = torch.rand(B, num_patches, device=device) < mask_ratio
-                partial_mask_ratio = 0.3  # 30% of masked patches will be partially masked
-                partial = (torch.rand(B, num_patches, device=device) < partial_mask_ratio) & mask
-                full = mask & (~partial)
-                
-                masked_patches = patches.clone()
-                if full.any():
-                    masked_patches[full] = model.mask_token
-                if partial.any():
-                    partial_idx = torch.nonzero(partial)
-                    num_partial = partial_idx.shape[0]
-                    new_patches = torch.full((num_partial, patch_dim), 0.5, device=device)
-                    rand_positions = torch.randint(0, patch_dim, (num_partial,), device=device)
-                    orig_vals = patches[partial_idx[:, 0], partial_idx[:, 1], :].gather(1, rand_positions.unsqueeze(1)).squeeze(1)
-                    new_patches[torch.arange(num_partial), rand_positions] = orig_vals
-                    masked_patches[partial_idx[:, 0], partial_idx[:, 1]] = new_patches
-                
-                # Vectorized target computation: calculate nearest vocab index for every patch.
-                patches_flat = patches.view(B * num_patches, patch_dim)
-                dists = torch.cdist(patches_flat, model.vocab)
-                targets = torch.argmin(dists, dim=1).view(B, num_patches)
-                
-                optimizer.zero_grad()
-                logits = model(masked_patches)
-                
-                if mask.sum() > 0:
-                    loss = criterion(logits[mask], targets[mask])
-                else:
-                    loss = torch.tensor(0.0, device=device)
-                
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                
-                predictions = torch.argmax(logits, dim=-1)
-                batch_correct = (predictions[mask] == targets[mask]).sum().item()
-                batch_total = mask.sum().item()
-                
-                correct += batch_correct
-                total += batch_total
-                total_loss += loss.item() * B
-                
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}", 
-                    'acc': f"{batch_correct/max(1, batch_total):.4f}",
-                    'mask': f"{mask_ratio:.2f}"
-                })
-        
-        avg_loss = total_loss / len(dataset)
-        avg_acc = correct / max(1, total)
-        cycle_losses.append(avg_loss)
-        cycle_accs.append(avg_acc)
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f}, Mask: {mask_ratio:.2f}")
-        
-        if use_wandb:
-            wandb.log({
-                'epoch': epoch,
-                'loss': avg_loss,
-                'accuracy': avg_acc,
-                'mask_ratio': mask_ratio,
-            })
-        
-        if (epoch + 1) % cycle_length == 0 or (epoch + 1) % visualize_every == 0 or (epoch + 1) == num_epochs:
-            model.eval()
-            with torch.no_grad():
-                for i, sample in enumerate(test_samples):
-                    masked_sample = sample.clone()
-                    H_img, W_img = sample.shape
-                    n_h = H_img // model.patch_size
-                    n_w = W_img // model.patch_size
-                    total_patches = n_h * n_w
-                    
-                    mask_indices = np.random.choice(total_patches, int(mask_ratio * total_patches), replace=False)
-                    for idx in mask_indices:
-                        i_patch = idx // n_w
-                        j_patch = idx % n_w
-                        masked_sample[i_patch*model.patch_size:(i_patch+1)*model.patch_size, 
-                                     j_patch*model.patch_size:(j_patch+1)*model.patch_size] = 0.5
-                    
-                    reconstructed = test_reconstruction(model, sample, masked_sample)
-                    
-                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-                    axes[0].imshow(sample.cpu().numpy(), cmap='gray')
-                    axes[0].set_title("Original")
-                    axes[0].axis('off')
-                    
-                    axes[1].imshow(masked_sample.cpu().numpy(), cmap='gray')
-                    axes[1].set_title(f"Masked ({mask_ratio:.2f})")
-                    axes[1].axis('off')
-                    
-                    axes[2].imshow(reconstructed.cpu().numpy(), cmap='gray')
-                    axes[2].set_title("Reconstructed")
-                    axes[2].axis('off')
-                    
-                    plt.tight_layout()
-                    if use_wandb:
-                        wandb.log({f"reconstruction_{i}": wandb.Image(fig)})
-                    plt.show()
-                    plt.close(fig)
-                    
-                if (epoch + 1) % cycle_length == 0 or (epoch + 1) == num_epochs:
-                    num_conditions = 30
-                    condition_indices = np.random.choice(image_size * image_size, num_conditions, replace=False)
-                    condition_values = np.random.choice([0, 1], num_conditions)
-                    gen, ll = sample_image_conditional(
-                        model, model.patch_size, image_size, temperature=1.0,
-                        condition_indices=condition_indices, condition_values=condition_values
-                    )
-                    gen_img = BinaryImageDataset.patches_to_image(gen[0], model.patch_size, image_size)
-                    fig, ax = plt.subplots(figsize=(8, 8))
-                    ax.imshow(gen_img.cpu().numpy(), cmap='gray')
-                    ax.set_title(f"Conditional Sample (LL: {ll:.2f})")
-                    ax.axis('off')
-                    if use_wandb:
-                        wandb.log({"conditional_sample": wandb.Image(fig)})
-                    plt.show()
-                    plt.close(fig)
-            
-            torch.save(model.state_dict(), f"{save_dir}/vit_patch{model.patch_size}_epoch{epoch+1}.pt")
-        
-        if (epoch + 1) % cycle_length == 0 or (epoch + 1) == num_epochs:
-            cycle_avg_loss = np.mean(cycle_losses)
-            cycle_avg_acc = np.mean(cycle_accs)
-            print(f"Cycle {cycle+1} completed, Avg Loss: {cycle_avg_loss:.4f}, Avg Acc: {cycle_avg_acc:.4f}")
-            if use_wandb:
-                wandb.log({
-                    'cycle': cycle + 1,
-                    'cycle_avg_loss': cycle_avg_loss,
-                    'cycle_avg_acc': cycle_avg_acc,
-                })
-            cycle_losses = []
-            cycle_accs = []
-    
-    return model
-
-########################################
-# Main Training Pipeline
-########################################
-
-def run_training(data_array, patch_size=3, hidden_dim=128, num_heads=8, num_layers=6, 
-                ffn_dim=512, dropout=0.1, batch_size=32, num_epochs=100, 
-                min_mask_ratio=0.05, max_mask_ratio=0.5, cycle_length=10, 
-                use_wandb=True, wandb_project="vit-discrete-tokens", wandb_name=None,
-                save_dir='./checkpoints', test_split=0.1, seed=42):
-    """Complete pipeline for training Vision Transformer with discrete tokens (with vectorized operations)."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if isinstance(data_array, torch.Tensor):
-        data_array = data_array.numpy()
-    
-    n_samples = data_array.shape[0]
-    indices = np.random.permutation(n_samples)
-    n_test = int(n_samples * test_split)
-    
-    train_data = torch.tensor(data_array[indices[n_test:]], dtype=torch.float32)
-    test_data = torch.tensor(data_array[indices[:n_test]], dtype=torch.float32)
-    
-    if train_data.max() > 1.0:
-        train_data /= 255.0
-        test_data /= 255.0
-    
-    if use_wandb:
-        run_name = wandb_name or f"vit_p{patch_size}_h{hidden_dim}_l{num_layers}_{int(time.time())}"
-        wandb.init(
-            project=wandb_project,
-            name=run_name,
-            config={
-                "patch_size": patch_size,
-                "hidden_dim": hidden_dim,
-                "num_heads": num_heads,
-                "num_layers": num_layers,
-                "ffn_dim": ffn_dim,
-                "dropout": dropout,
-                "batch_size": batch_size,
-                "min_mask_ratio": min_mask_ratio,
-                "max_mask_ratio": max_mask_ratio,
-                "cycle_length": cycle_length
-            }
-        )
-    
-    print("Building vocabulary...")
+    # Build vocabulary from a dummy dataset (using this image alone)
     vocab, fully_masked_idx, partial_token_indices, masked_token_param, partial_masked_token_params = build_vocabulary(
-        train_data, patch_size, partial_masked_token=True
+        dummy_image_tensor, patch_size, partial_masked_token=True
     )
     
-    print(f"Creating model with {hidden_dim} hidden dim, {num_layers} layers, {num_heads} heads")
+    # Create a VisionTransformer (using relatively small parameters for debugging)
+    hidden_dim = 64
+    num_heads = 4
+    num_layers = 2
+    ffn_dim = 128
+    max_seq_len = (H // patch_size) * (W // patch_size)  # here, 16 patches
     model = VisionTransformer(
         vocab=vocab,
         fully_masked_idx=fully_masked_idx,
@@ -675,55 +388,90 @@ def run_training(data_array, patch_size=3, hidden_dim=128, num_heads=8, num_laye
         num_layers=num_layers,
         ffn_dim=ffn_dim,
         hidden_dim=hidden_dim,
-        dropout=dropout
-    ).to(device)
-    
-    print("Starting training...")
-    model = train_vit(
-        model=model,
-        train_data=train_data,
-        test_data=test_data,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
-        min_mask_ratio=min_mask_ratio,
-        max_mask_ratio=max_mask_ratio,
-        cycle_length=cycle_length,
-        use_wandb=use_wandb,
-        save_dir=save_dir
+        max_seq_len=max_seq_len,
+        dropout=0.1
     )
     
-    if use_wandb:
-        wandb.finish()
+    # Move model to device (CPU for testing)
+    device = torch.device("cpu")
+    model.to(device)
     
-    return model
-
-########################################
-# Example Training Run
-########################################
-
-# Example usage:
-# import numpy as np
-# import torch
-# import wandb
-#
-# # Optional: login to wandb
-# # wandb.login()
-#
-# # Assume training_data is a NumPy array of shape (N, H, W)
-# model = run_training(
-#     training_data,
-#     patch_size=3,           # Size of image patches (3x3)
-#     hidden_dim=64,          # Hidden dimension for transformer
-#     num_heads=4,            # Number of attention heads
-#     num_layers=2,           # Number of transformer layers
-#     ffn_dim=128,            # Feedforward network dimension
-#     dropout=0.1,            # Dropout rate
-#     batch_size=32,          # Batch size
-#     num_epochs=500,         # Number of training epochs
-#     min_mask_ratio=0.05,    # Minimum masking ratio
-#     max_mask_ratio=0.95,    # Maximum masking ratio
-#     cycle_length=20,        # Length of masking cycle (epochs)
-#     use_wandb=False,        # Whether to use wandb logging
-#     wandb_project="my-vit-project",  # Wandb project name
-#     save_dir='./checkpoints'  # Directory to save checkpoints
-# )
+    # Extract patches before masking
+    patches = BinaryImageDataset.batch_to_patches(dummy_image_tensor, patch_size)
+    print("\nPatches before masking (shape {}):".format(patches.shape))
+    print(patches)
+    
+    # Simulate a masking step.
+    # For simplicity, let’s create a mask that marks half the patches as masked.
+    B, num_patches, patch_dim = patches.shape
+    mask_ratio = 0.5
+    mask = torch.rand(B, num_patches) < mask_ratio
+    
+    # Create a copy of patches for masked_patches.
+    masked_patches = patches.clone()
+    # For fully masked patches: replace with the model's mask token (value 0.5 vector)
+    masked_patches[mask] = model.mask_token  # full masking; ignore partial for now
+    print("\nPatches after masking:")
+    print(masked_patches)
+    
+    # Check the output of _process_batch:
+    processed_patches, token_indices = model._process_batch(masked_patches)
+    print("\nProcessed Patches after _process_batch (should have masked tokens for masked patches):")
+    print(processed_patches)
+    print("\nToken Indices from _process_batch:")
+    print(token_indices)
+    
+    # Forward pass: get logits
+    logits = model(masked_patches)
+    print("\nLogits shape (should be [B, num_patches, vocab_size]):", logits.shape)
+    # Print logits for first patch as an example
+    print("\nLogits for first patch:")
+    print(logits[0, 0])
+    
+    # Check _find_closest_token on the first original patch:
+    sample_patch = patches[0,0]
+    closest_token_idx = model._find_closest_token(sample_patch)
+    print("\nFirst patch (original):")
+    print(sample_patch)
+    print("\nClosest token index (via _find_closest_token):", closest_token_idx.item())
+    print("Vocabulary entry for that token:")
+    print(model.vocab[closest_token_idx])
+    
+    # Optionally, compute a loss on the masked patches.
+    # Compute vectorized target tokens (for all patches in the batch)
+    patches_flat = patches.view(B * num_patches, patch_dim)
+    dists = torch.cdist(patches_flat, model.vocab)
+    targets = torch.argmin(dists, dim=1).view(B, num_patches)
+    criterion = nn.CrossEntropyLoss()
+    if mask.sum() > 0:
+        loss = criterion(logits[mask], targets[mask])
+        print("\nLoss computed on masked patches:", loss.item())
+    else:
+        print("\nNo patches masked; cannot compute loss.")
+    
+    # For visualization, you can also reconstruct the image.
+    # Simulate a masked image: (set masked patches to 0.5 again)
+    dummy_masked_image = dummy_image_tensor.clone()
+    # For each patch in the image, if its corresponding patch in masked_patches is mask_token, set it to 0.5.
+    # (This is a simplistic reassembly for visualization.)
+    reconstructed = test_reconstruction(model, dummy_image_tensor.squeeze(0), dummy_masked_image.squeeze(0))
+    print("\nReconstructed image (as tensor):")
+    print(reconstructed)
+    
+    # Optionally visualize using matplotlib:
+    plt.figure(figsize=(12, 3))
+    plt.subplot(1, 3, 1)
+    plt.imshow(dummy_image, cmap='gray')
+    plt.title("Original Image")
+    plt.axis('off')
+    plt.subplot(1, 3, 2)
+    plt.imshow(masked_patches[0].view(H // patch_size, W // patch_size, patch_size, patch_size)
+               .permute(0,2,1,3).reshape(H, W).cpu().numpy(), cmap='gray')
+    plt.title("Masked Patches (Reassembled)")
+    plt.axis('off')
+    plt.subplot(1, 3, 3)
+    plt.imshow(reconstructed.cpu().numpy(), cmap='gray')
+    plt.title("Reconstructed")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
