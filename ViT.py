@@ -159,3 +159,16 @@ class BinaryImageDataset(Dataset):
         patches = images.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)
         patches = patches.contiguous().view(B, -1, patch_size * patch_size)
         return patches
+
+########################################
+# Global Reconstruction Loss
+########################################
+
+# Global loss module (L1 loss between the reconstructed image and the ground-truth)
+class GlobalReconstructionLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, reconstructed_image, ground_truth):
+        return self.l1(reconstructed_image, ground_truth)
