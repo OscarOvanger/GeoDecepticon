@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import math
+from ViT import *
 ########################################
 # Generates conditional images
 ########################################
