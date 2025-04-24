@@ -94,9 +94,9 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
             targets = torch.argmin(dists, dim=1).view(B, N)
 
             if mask.sum() > 0:
-                loss = criterion(logits[mask], targets[mask])
+                loss_mask = criterion(logits[mask], targets[mask])
             else:
-                loss = torch.tensor(0.0, device=device)
+                loss_mask = torch.tensor(0.0, device=device)
 
             pred_ids     = logits.argmax(dim=-1)             # [B, N]
             pred_patches = model.vocab[pred_ids]             # [B, N, D]
@@ -116,7 +116,7 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * mask.sum().item()
+            total_loss += loss_mask.item() * mask.sum().item()
             preds = logits.argmax(dim=-1)
             total_correct += (preds[mask] == targets[mask]).sum().item()
             total_masked += mask.sum().item()
