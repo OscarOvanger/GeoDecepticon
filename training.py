@@ -1,3 +1,4 @@
+from ViT_sampling import *
 ########################################
 # Training Loop with Progress Bar and Updated Plotting
 ########################################
@@ -135,7 +136,7 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
                                 3541,2226,3423,1904,2882,2540,1497,2524,264,1441])
             condition_values = np.array([0,1,1,1,0,0,1,0,0,1,0,0,0,1,0,1,0,0,1,0,
                                           1,1,1,0,1,0,1,1,0,1])
-            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices=None, condition_values=None) #unconditional for now
+            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices, condition_values) #unconditional for now
             # Create a figure for the generated image.
             fig_gen, ax_gen = plt.subplots(figsize=(12,12))
             # Convert conditions to grid coordinates for plotting.
