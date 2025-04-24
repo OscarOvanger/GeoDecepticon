@@ -152,7 +152,7 @@ def generate_image(
 
 
 
-def generate_images_batch(model, patch_size, image_size, batch_size, 
+def generate_images_batch(model, patch_size, image_size, batch_size,device, 
                           condition_indices=None, condition_values=None, 
                           generation_order="manhattan"):
     """
@@ -265,3 +265,128 @@ def generate_images_batch(model, patch_size, image_size, batch_size,
         generated_images.append(img)
     generated_images = torch.stack(generated_images)
     return generated_images, log_likelihoods
+
+
+def generate_images_batch_method1(
+    model,
+    patch_size: int,
+    image_size: int,
+    batch_size: int,
+    device,
+    condition_indices=None,
+    condition_values=None
+):
+    """
+    Method 1: 'sample‐all‐then‐select' batch generation.
+    
+    Args:
+      model: a trained StackedContextViT on device.
+      patch_size: size of one patch (e.g. 8).
+      image_size: full image side length (e.g. 64).
+      batch_size: how many images to generate in parallel.
+      condition_indices: list of flat pixel indices to condition on (optional).
+      condition_values: list of 0/1 values for each index (optional).
+    
+    Returns:
+      generated_images: Tensor [batch_size, image_size, image_size]
+      log_likelihoods: list of length batch_size
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # grid & patch dims
+    grid_size    = image_size // patch_size
+    total_patches = grid_size * grid_size
+    patch_dim     = patch_size * patch_size
+    
+    # initialize all patches to the mask token
+    mask_tok = model.mask_token.detach().to(device)             # [patch_dim]
+    # [batch, total_patches, patch_dim]
+    gen_patches = mask_tok.view(1, total_patches, patch_dim) \
+                         .expand(batch_size, -1, -1).clone()
+    
+    # build conditioning dict: {patch_idx: [(local_idx, val), ...], ...}
+    cond_by_patch = {}
+    if condition_indices is not None and condition_values is not None:
+        for pix_idx, val in zip(condition_indices, condition_values):
+            row = pix_idx // image_size
+            col = pix_idx %  image_size
+            prow, pcol = row // patch_size, col // patch_size
+            patch_idx = prow * grid_size + pcol
+            local_r = row % patch_size
+            local_c = col %  patch_size
+            local_idx = local_r * patch_size + local_c
+            cond_by_patch.setdefault(patch_idx, []).append((local_idx, val))
+    observed = sorted(cond_by_patch.keys())
+    
+    # track which patches are already filled
+    filled = torch.zeros(batch_size, total_patches, dtype=torch.bool, device=device)
+    filled[:, observed] = True
+    
+    # initialize log‐likelihood accumulators
+    log_liks = [0.0] * batch_size
+    
+    # 1) **First**, fill observed patches (sampling under constraints)
+    if observed:
+        with torch.no_grad():
+            logits_obs, _ = model(gen_patches, mask_rate=0.0)  # [B, P, V]
+        for p in observed:
+            # logits for this patch: [B, V]
+            lc = logits_obs[:, p, :].clone()
+            # apply conditioning mask
+            valid = torch.ones(model.vocab_size, dtype=torch.bool, device=device)
+            for (lidx, v) in cond_by_patch[p]:
+                valid &= (model.vocab[:, lidx] == v)
+            lc[:, ~valid] = -float('inf')
+            
+            probs = F.softmax(lc, dim=-1)              # [B, V]
+            samp = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
+            # update log‐likelihoods
+            for i in range(batch_size):
+                log_liks[i] += math.log(probs[i, samp[i]].item() + 1e-10)
+            # write sampled patch into gen_patches
+            gen_patches[torch.arange(batch_size), p, :] = model.vocab[samp].to(device)
+    
+    # 2) **Then**, iteratively fill the remaining patches
+    to_fill = total_patches - len(observed)
+    for _ in range(to_fill):
+        with torch.no_grad():
+            logits, _ = model(gen_patches, mask_rate=0.0)  # [B, P, V]
+        
+        B, P, V = logits.shape
+        # flatten for multinomial
+        flat_logits = logits.view(B*P, V)
+        flat_probs  = F.softmax(flat_logits, dim=-1)
+        flat_samps  = torch.multinomial(flat_probs, num_samples=1).squeeze(-1)  # [B*P]
+        flat_liks   = flat_probs[torch.arange(B*P, device=device), flat_samps]
+        
+        # reshape back
+        samps = flat_samps.view(B, P)   # [B, P]
+        pliks = flat_liks.view(B, P)    # [B, P]
+        
+        # for filled positions, zero out so they won't be picked
+        pliks[filled] = -float('inf')
+        
+        # for each image, pick the patch with highest sampled prob
+        choice_patches = torch.argmax(pliks, dim=1)  # [B]
+        
+        # gather sampled_vocab_idx and accumulate log‐lik
+        batch_idx = torch.arange(B, device=device)
+        sel_vocab = samps[batch_idx, choice_patches]  # [B]
+        for i in range(B):
+            log_liks[i] += math.log(pliks[i, choice_patches[i]].item() + 1e-10)
+        
+        # write into gen_patches
+        gen_patches[batch_idx, choice_patches, :] = model.vocab[sel_vocab].to(device)
+        # mark filled
+        filled[batch_idx, choice_patches] = True
+    
+    # reconstruct images from patches
+    from your_notebook import patches_to_image  # or wherever you defined it
+    gen_images = []
+    for i in range(batch_size):
+        img = patches_to_image(gen_patches[i].cpu(), (image_size, image_size), patch_size)
+        gen_images.append(img)
+    gen_images = torch.stack(gen_images)  # [B, H, W]
+    
+    return gen_images, log_liks
