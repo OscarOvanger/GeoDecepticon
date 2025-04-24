@@ -387,7 +387,6 @@ def generate_images_batch_method1(
         filled[batch_idx, choice_patches] = True
     
     # reconstruct images from patches
-    from your_notebook import patches_to_image  # or wherever you defined it
     gen_images = []
     for i in range(batch_size):
         img = patches_to_image(gen_patches[i].cpu(), (image_size, image_size), patch_size)
