@@ -302,8 +302,13 @@ def generate_images_batch_method1(
     # initialize all patches to the mask token
     mask_tok = model.mask_token.detach().to(device)             # [patch_dim]
     # [batch, total_patches, patch_dim]
-    gen_patches = mask_tok.view(1, total_patches, patch_dim) \
-                         .expand(batch_size, -1, -1).clone()
+    gen_patches = (
+        mask_tok
+        .unsqueeze(0)       # [1, patch_dim]
+        .unsqueeze(0)       # [1, 1, patch_dim]
+        .expand(batch_size, total_patches, patch_dim)
+        .clone()            # [batch_size, total_patches, patch_dim]
+    )
     
     # build conditioning dict: {patch_idx: [(local_idx, val), ...], ...}
     cond_by_patch = {}
