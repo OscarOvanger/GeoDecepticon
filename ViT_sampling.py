@@ -143,3 +143,118 @@ def generate_image(
 
     return generated_image, log_likelihood_sum
 
+
+
+def generate_images_batch(model, patch_size, image_size, batch_size, 
+                          condition_indices=None, condition_values=None, 
+                          generation_order="manhattan"):
+    """
+    Generate a batch of images (batch_size images) in parallel.
+    If condition_indices and condition_values are provided, they apply to all images in the batch.
+    (For simplicity, this implementation assumes the same conditioned pixel positions for all images.)
+    Returns: (tensor of shape [batch_size, image_size, image_size], list of log-likelihoods)
+    """
+    model.eval()
+    grid_size = image_size // patch_size
+    total_patches = grid_size * grid_size
+    patch_dim = patch_size * patch_size
+
+    # Initialize all images' patches as mask token
+    mask_patch = model.mask_token.detach()  # [patch_dim]
+    # Create [batch_size, total_patches, patch_dim] filled with mask token
+    generated_patches = mask_patch.unsqueeze(0).expand(total_patches, patch_dim)
+    generated_patches = generated_patches.unsqueeze(0).expand(batch_size, total_patches, patch_dim).clone().to(device)
+
+    # Prepare condition constraints for patches (same for each image for now)
+    conditions_by_patch = {}
+    observed_patch_ids = []
+    if condition_indices is not None and condition_values is not None:
+        condition_indices = np.array(condition_indices)
+        condition_values = np.array(condition_values)
+        if condition_values.ndim == 1:
+            # Use the same condition values for all images
+            condition_values_batch = np.tile(condition_values, (batch_size, 1))
+        else:
+            # If a different set of values per image is provided (condition_values shape [batch, k]),
+            # we'll take the first one as representative for ordering (assuming indices same).
+            condition_values_batch = condition_values
+        # Build a dictionary of constraints for each patch (assuming all images share condition indices)
+        for cond_idx, cond_val in zip(condition_indices, condition_values_batch[0]):
+            pixel_row = cond_idx // image_size
+            pixel_col = cond_idx % image_size
+            patch_row = pixel_row // patch_size
+            patch_col = pixel_col // patch_size
+            patch_idx = patch_row * grid_size + patch_col
+            local_row = pixel_row % patch_size
+            local_col = pixel_col % patch_size
+            local_idx = local_row * patch_size + local_col
+            conditions_by_patch.setdefault(patch_idx, []).append((local_idx, cond_val))
+        observed_patch_ids = sorted(conditions_by_patch.keys())
+    else:
+        condition_values_batch = None
+
+    # Determine generation order for patches
+    all_patches = set(range(total_patches))
+    unobserved_patch_ids = list(all_patches - set(observed_patch_ids))
+    if generation_order == "manhattan" and observed_patch_ids:
+        distance_list = []
+        for p in unobserved_patch_ids:
+            row, col = divmod(p, grid_size)
+            dist_sum = 0
+            for op in observed_patch_ids:
+                orow, ocol = divmod(op, grid_size)
+                dist_sum += abs(row - orow) + abs(col - ocol)
+            distance_list.append((p, dist_sum))
+        distance_list.sort(key=lambda x: x[1])
+        unobserved_patch_ids = [p for p, _ in distance_list]
+    elif generation_order == "raster":
+        unobserved_patch_ids.sort()
+    elif generation_order == "random":
+        np.random.shuffle(unobserved_patch_ids)
+    else:
+        raise ValueError(f"Unknown generation_order: {generation_order}")
+
+    sampling_order = observed_patch_ids + unobserved_patch_ids
+
+    # Initialize log-likelihood sums for each image in batch
+    log_likelihoods = [0.0] * batch_size
+
+    # Iteratively generate each patch for all images in parallel
+    for p_idx in sampling_order:
+        with torch.no_grad():
+            # Forward pass for all images with current known patches
+            logits, _ = model(generated_patches, mask_rate=0.0)  # [batch, total_patches, vocab_size]
+        # logits for the current patch index for all images: shape [batch_size, vocab_size]
+        logits_current = logits[:, p_idx, :].clone()
+
+        # If this patch is conditioned (observed) and we have constraints:
+        if p_idx in conditions_by_patch:
+            # We restrict vocabulary choices for all images based on the condition.
+            # (Assuming same condition constraint for all images.)
+            valid_vocab = torch.ones(model.vocab_size, dtype=torch.bool, device=device)
+            for local_idx, val in conditions_by_patch[p_idx]:
+                valid_vocab &= (model.vocab[:, local_idx] == val)
+            # Set invalid vocab logits to -inf for all images
+            logits_current[:, ~valid_vocab] = -float('inf')
+
+        # Compute probabilities and sample a patch for each image in the batch
+        probs = F.softmax(logits_current, dim=-1)  # [batch_size, vocab_size]
+        sampled_indices = []
+        for i in range(batch_size):
+            idx = torch.multinomial(probs[i], num_samples=1).item()
+            sampled_indices.append(idx)
+            # Accumulate log-likelihood for each image
+            log_likelihoods[i] += math.log(probs[i, idx].item() + 1e-10)
+        sampled_indices = torch.tensor(sampled_indices, device=device)
+        # Retrieve the actual patch values for these sampled vocab indices
+        sampled_patches = model.vocab[sampled_indices]  # [batch_size, patch_dim]
+        # Update the generated patches for all images at position p_idx
+        generated_patches[:, p_idx, :] = sampled_patches
+
+    # All patches filled, reconstruct images
+    generated_images = []
+    for i in range(batch_size):
+        img = patches_to_image(generated_patches[i].cpu(), (image_size, image_size), patch_size)
+        generated_images.append(img)
+    generated_images = torch.stack(generated_images)
+    return generated_images, log_likelihoods
