@@ -54,6 +54,9 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.8)
     criterion = nn.CrossEntropyLoss()
 
+    #Weight for reconstruction loss
+    alpha = 0.5
+    
     for epoch in range(nr_epochs):
         # Compute the current masking rate according to the selected schedule.
         if mask_schedule == "linear":
@@ -95,6 +98,20 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
             else:
                 loss = torch.tensor(0.0, device=device)
 
+            pred_ids     = logits.argmax(dim=-1)             # [B, N]
+            pred_patches = model.vocab[pred_ids]             # [B, N, D]
+            # vectorized reassembly:
+            recon_images = []
+            for i in range(B):
+                recon_images.append(
+                    patches_to_image(pred_patches[i], (H_img, W_img), patch_size)
+                )
+            recon_images = torch.stack(recon_images).to(device)  # [B, H, W]
+            loss_recon = F.l1_loss(recon_images, batch)
+
+            # combined loss
+            loss = loss_mask + alpha * loss_recon
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -117,6 +134,9 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
         # Log epoch metrics.
         wandb.log({
             "epoch": epoch+1,
+            "masked_CE": loss_mask.item(),
+            "recon_L1": loss_recon.item(),
+            "combined_loss": loss.item(),
             "avg_loss": avg_loss,
             "masked_accuracy": acc,
             "mask_rate": current_mask_rate,
