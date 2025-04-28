@@ -12,7 +12,7 @@ def generate_image_mla(
     generation_order="manhattan"
 ):
     model.eval()
-    grid = image_size // patch_size
+    grid_size = image_size // patch_size
     total_patches = grid * grid
     patch_dim = patch_size * patch_size
     device = next(model.parameters()).device
@@ -118,9 +118,10 @@ def generate_image_mla(
         #    we can re‐embed with patch_proj+pos once, then propagate through blocks 
         #    up to each block’s start. For simplicity here we
         #    assume the same `x_tokens` used in init_kv_cache:
-        x_tok = model.patch_proj(new_patch) + model.pos_emb[pidx].unsqueeze(0)
+        x_patch = model.patch_proj(new_patch) + model.pos_emb[pidx].unsqueeze(0)
         for layer_i in range(len(model.encoder_layers)):
-            model.update_kv_cache(layer_i, pidx, x_tok)
+            x_patch = block(x_patch.unsqueeze(1),attn_bias=None).squeeze(1)
+            model.update_kv_cache(layer_i, pidx, x_patch)
 
     # Reconstruct final image
     final = patches_to_image(gen_patches[0].cpu(), (image_size, image_size), patch_size)
@@ -132,7 +133,7 @@ def generate_images_batch_mla(
     generation_order="manhattan"
 ):
     model.eval()
-    grid = image_size // patch_size
+    grid_size = image_size // patch_size
     total_patches = grid * grid
     patch_dim = patch_size * patch_size
     device = next(model.parameters()).device
@@ -141,7 +142,7 @@ def generate_images_batch_mla(
     model.init_kv_cache(batch_size=batch_size, total_patches=total_patches)
 
     # B) init gen_patches [B,P,D]
-    gen_patches = model.mask_token.to(device).view(1,1,patch_dim) \
+    gen_patches = model.mask_token.to(device).view(1,total_patches,patch_dim) \
                    .expand(batch_size, total_patches, patch_dim).clone()
 
     # C) build sampling_order & conditions_by_patch as before…
@@ -214,9 +215,10 @@ def generate_images_batch_mla(
         new_patches = model.vocab[samp].to(device)  # [B, patch_dim]
         gen_patches[:, pidx] = new_patches
         # update each layer’s KV cache for pidx
-        x_tok = model.patch_proj(new_patches) + model.pos_emb[pidx].unsqueeze(0)
+        x_patch = model.patch_proj(new_patches) + model.pos_emb[pidx].unsqueeze(0)
         for li in range(len(model.encoder_layers)):
-            model.update_kv_cache(li, pidx, x_tok)
+            x_patch = block(x_patch.unsqueeze(1), attn_bias=None).squeeze(1) 
+            model.update_kv_cache(li, pidx, x_patch)
 
     # reconstruct
     imgs = [patches_to_image(gen_patches[i].cpu(), (image_size, image_size), patch_size)
@@ -228,7 +230,7 @@ def generate_images_batch_method1_mla(
     condition_indices=None, condition_values=None
 ):
     model.eval()
-    grid = image_size // patch_size
+    grid_size = image_size // patch_size
     total_patches = grid * grid
     patch_dim = patch_size * patch_size
     device = next(model.parameters()).device
@@ -277,7 +279,7 @@ def generate_images_batch_method1_mla(
             samp = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
             # update log‐likelihoods
             for i in range(batch_size):
-                log_liks[i] += math.log(probs[i, samp[i]].item() + 1e-10)
+                loglikes[i] += math.log(probs[i, samp[i]].item() + 1e-10)
             # write sampled patch into gen_patches
             new_patches = model.vocab[samp].to(device)  # [B, patch_dim]
             gen_patches[torch.arange(batch_size), p, :] = new_patches
@@ -295,6 +297,8 @@ def generate_images_batch_method1_mla(
         flat_samps  = torch.multinomial(flat_probs, 1).squeeze(-1)
         flat_lp     = flat_probs[torch.arange(batch_size*total_patches, device=device), flat_samps]
 
+        B = batch_size
+        P = total_patches
         samps = flat_samps.view(B, P)   # [B, P]
         pliks = flat_lp.view(B, P)    # [B, P]
         
@@ -308,7 +312,7 @@ def generate_images_batch_method1_mla(
         batch_idx = torch.arange(B, device=device)
         sel_vocab = samps[batch_idx, choice_patches]  # [B]
         for i in range(B):
-            log_liks[i] += math.log(pliks[i, choice_patches[i]].item() + 1e-10)
+            loglikes[i] += math.log(pliks[i, choice_patches[i]].item() + 1e-10)
         
         # write into gen_patches
         new_patches = model.vocab[sel_vocab].to(device)
