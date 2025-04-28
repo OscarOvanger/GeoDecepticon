@@ -156,6 +156,91 @@ class StackedContextViT(nn.Module):
         logits = self.out_proj(x)  # [B, N, vocab_size]
         return logits, mask
 
+    def init_kv_cache(self, batch_size, total_patches):
+        """
+        Initialize the latent KV caches for a batch of all-masked inputs.
+        After this, model.Kc_cache and model.Vc_cache are lists of length num_layers,
+        each entry a tensor [batch_size, total_patches, latent_dim].
+        """
+        device = next(self.parameters()).device
+        # Create a dummy input where every patch is the mask token
+        x_tokens = self.mask_token.to(device).view(1, 1, -1) \
+                    .expand(batch_size, total_patches, -1)
+        # Project into embedding+pos
+        x = self.patch_proj(x_tokens) + self.pos_emb.unsqueeze(0)
+        self.Kc_cache = []
+        self.Vc_cache = []
+        # For each MLA layer, compute and store the latent caches
+        for block in self.encoder_layers:
+            Kc = block.Wa_K(x)  # [B, P, latent_dim]
+            Vc = block.Wa_V(x)
+            self.Kc_cache.append(Kc)
+            self.Vc_cache.append(Vc)
+            # Now simulate the rest of block (so x is fresh for next layer):
+            K = block.Wb_K(Kc)
+            V = block.Wb_V(Vc)
+            # compute Q, attention, ffn exactly as in block.forward up to output x
+            Q = block.Wq(x)
+            B, N, _ = x.shape
+            h, d = block.num_heads, block.head_dim
+            Qh = Q.view(B, N, h, d).permute(0,2,1,3)
+            Kh = K.view(B, N, h, d).permute(0,2,1,3)
+            Vh = V.view(B, N, h, d).permute(0,2,1,3)
+            scores = (Qh @ Kh.transpose(-2,-1)) / math.sqrt(d)
+            if hasattr(self, 'rel_bias'):
+                scores = scores + self.rel_bias[:N,:N].unsqueeze(0).unsqueeze(0)
+            W = F.softmax(scores, dim=-1)
+            attn = (W @ Vh).permute(0,2,1,3).reshape(B, N, self.emb_dim)
+            x = block.norm1(x + block.out_proj_attn(attn))
+            x = block.norm2(x + block.ffn(x))
+
+    def update_kv_cache(self, layer_idx, patch_idx, new_x_patch):
+        """
+        After you fill a new patch (so its embedding changed), call this
+        for each layer to update that layer's latent caches at that index.
+        - new_x_patch is shape [batch_size, emb_dim], the input tokens x after patch_proj+pos.
+        """
+        block = self.encoder_layers[layer_idx]
+        # Update only that slice of Kc/Vc
+        self.Kc_cache[layer_idx][:, patch_idx, :] = block.Wa_K(new_x_patch)
+        self.Vc_cache[layer_idx][:, patch_idx, :] = block.Wa_V(new_x_patch)
+
+    def forward_from_cache(self, x_tokens, mask_rate=0.0):
+        """
+        Like forward(), but uses self.Kc_cache and self.Vc_cache as the
+        latent key/value for each layer, updating them if mask_rate>0.
+        x_tokens: [B, P, patch_dim] input patches (including mask)
+        Returns logits [B,P,vocab_size], mask flags [B,P]
+        """
+        B, N, _ = x_tokens.size()
+        # Recompute mask & x embedding
+        mask = torch.rand(B, N, device=x_tokens.device) < mask_rate
+        x_tokens = x_tokens.clone()
+        x_tokens[mask] = self.mask_token.to(x_tokens.device)
+        x = self.patch_proj(x_tokens) + self.pos_emb.unsqueeze(0)
+
+        # For each layer, grab cached Kc/Vc, expand to K/V, then do attention & ffn
+        for i, block in enumerate(self.encoder_layers):
+            Kc = self.Kc_cache[i]  # [B,P,latent_dim]
+            Vc = self.Vc_cache[i]
+            K = block.Wb_K(Kc)
+            V = block.Wb_V(Vc)
+            Q = block.Wq(x)
+            B, P, _ = x.shape
+            h, d = block.num_heads, block.head_dim
+            Qh = Q.view(B,P,h,d).permute(0,2,1,3)
+            Kh = K.view(B,P,h,d).permute(0,2,1,3)
+            Vh = V.view(B,P,h,d).permute(0,2,1,3)
+            scores = (Qh @ Kh.transpose(-2,-1)) / math.sqrt(d)
+            scores = scores + self.rel_bias[:P,:P].unsqueeze(0).unsqueeze(0)
+            W = F.softmax(scores, dim=-1)
+            attn = (W @ Vh).permute(0,2,1,3).reshape(B, P, self.emb_dim)
+            x = block.norm1(x + block.out_proj_attn(attn))
+            x = block.norm2(x + block.ffn(x))
+
+        logits = self.out_proj(x)
+        return logits, mask
+
 ########################################
 # Dataset Class
 ########################################
