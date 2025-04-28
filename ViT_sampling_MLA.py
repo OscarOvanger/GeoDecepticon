@@ -284,9 +284,10 @@ def generate_images_batch_method1_mla(
             new_patches = model.vocab[samp].to(device)  # [B, patch_dim]
             gen_patches[torch.arange(batch_size), p, :] = new_patches
             #Update KV Cache
-            x_tok = model.patch_proj(new_patches) + model.pos_emb[p].unsqueeze(0)
+            x_patch = model.patch_proj(new_patches) + model.pos_emb[p].unsqueeze(0)
             for li in range(len(model.encoder_layers)):
-                model.update_kv_cache(li, p, x_tok)
+                x_patch = block(x_patch.unsqueeze(1), attn_bias=None).squeeze(1) 
+                model.update_kv_cache(li, p, x_patch)
                 
     # 2) dynamic steps:
     to_fill = total_patches - len(observed)
@@ -320,9 +321,10 @@ def generate_images_batch_method1_mla(
         # mark filled
         filled[batch_idx, choice_patches] = True
         #Update KV Cache
-        x_tok = model.patch_proj(new_patches) + model.pos_emb[choice_patches].unsqueeze(0)
+        x_patch = model.patch_proj(new_patches) + model.pos_emb[choice_patches].unsqueeze(0)
         for li in range(len(model.encoder_layers)):
-            model.update_kv_cache(li, choice_patches, x_tok)
+            x_patch = block(x_patch.unsqueeze(1), attn_bias=None).squeeze(1) 
+            model.update_kv_cache(li, choice_patches, x_patch)
     
     # reconstruct images from patches
     gen_images = []
