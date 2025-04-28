@@ -1,10 +1,14 @@
 from ViT_sampling import *
+from ViT_sampling_MLA import *
 ########################################
 # Training Loop with Progress Bar and Updated Plotting
 ########################################
 
 import wandb  # make sure wandb is installed: pip install wandb
-def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rate, mask_schedule, patch_size, num_heads, num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap):
+def run_training(training_data, nr_epochs, batch_size, mask_rate, 
+                 final_mask_rate, mask_schedule, patch_size, num_heads, 
+                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap,
+                MLA = True):
     """
     training_data: numpy array or tensor of shape [N, H, W] (binary images)
     nr_epochs: number of epochs for training
@@ -151,17 +155,24 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate, final_mask_rat
         # ---- Every 10 epochs, perform conditional generation and log to wandb ----
         if (epoch+1) % 50 == 0:
             # Sample conditions for generation.
-            condition_indices = np.array([876,3825,2122,2892,1556,2683,3667,1767,483,2351,
-                                2000,3312,2953,289,2373,2720,872,2713,1206,1341,
-                                3541,2226,3423,1904,2882,2540,1497,2524,264,1441])
-            condition_values = np.array([0,1,1,1,0,0,1,0,0,1,0,0,0,1,0,1,0,0,1,0,
-                                          1,1,1,0,1,0,1,1,0,1])
-            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices, condition_values) #unconditional for now
+            if MLA:
+                condition_indices = np.array([1726-640,3797-640,4211-640,4543-640,3953-640,3347-640,1897-640,2015-640,4424-640,1942-640,2108-640,4350-640,1019-640,4068-640,2911-640])
+                condition_values = np.array([0,1,0,1,1,1,0,1,0,1,0,1,1,1,0])
+                condition_indices_x = (condition_indices_new // 80) - 8
+                condition_indices_y = (condition_indices_new % 80) - 8
+                generated_img, log_likelihood_sum = generate_image_mla(model, patch_size, W_img, condition_indices, condition_values)
+            else:
+                condition_indices = np.array([876,3825,2122,2892,1556,2683,3667,1767,483,2351,
+                                    2000,3312,2953,289,2373,2720,872,2713,1206,1341,
+                                    3541,2226,3423,1904,2882,2540,1497,2524,264,1441])
+                condition_values = np.array([0,1,1,1,0,0,1,0,0,1,0,0,0,1,0,1,0,0,1,0,
+                                              1,1,1,0,1,0,1,1,0,1])
+                condition_indices_x = condition_indices // W_img
+                condition_indices_y = condition_indices % W_img
+                generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices, condition_values) 
             # Create a figure for the generated image.
             fig_gen, ax_gen = plt.subplots(figsize=(12,12))
             # Convert conditions to grid coordinates for plotting.
-            condition_indices_x = condition_indices // W_img
-            condition_indices_y = condition_indices % W_img
             ax_gen.imshow(generated_img.cpu().detach().numpy(), cmap='gray', vmin=0, vmax=1)
             ax_gen.scatter(condition_indices_y, condition_indices_x, c=condition_values, cmap='viridis')
             ax_gen.set_title(f"Conditional Generation @ Epoch {epoch+1}\nLL: {log_likelihood_sum:.4f}")
