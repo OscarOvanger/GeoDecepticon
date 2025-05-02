@@ -94,51 +94,98 @@ class TransformerEncoderBlock(nn.Module):
         return x
 
 class StackedContextViT(nn.Module):
-    def __init__(self, vocab, mask_token, patch_dim, num_patches, emb_dim=128, num_heads=1,
-                 num_layers=1, ffn_dim=None,pos_emb=None,rel_bias=None):
+    def __init__(
+        self,
+        vocab,                # Tensor [V, D]
+        mask_token,           # Parameter [D]
+        patch_dim,            # D
+        num_patches,          # N
+        emb_dim=128,
+        num_heads=1,
+        num_layers=1,
+        ffn_dim=None,
+
+        # new args:
+        use_pos_emb: bool = True,
+        pos_emb_init: torch.Tensor | None = None,   # if provided, must be [N, emb_dim]
+        use_rel_bias: bool = True,
+        rel_bias_init: torch.Tensor | None = None   # if provided, must be [N, N]
+    ):
         super().__init__()
-        self.vocab = vocab
+        self.vocab      = vocab
         self.vocab_size = vocab.size(0)
-        self.patch_dim = patch_dim
-        self.emb_dim = emb_dim
-        self.mask_token = mask_token
-        self.num_patches = num_patches
+        self.patch_dim  = patch_dim
+        self.emb_dim    = emb_dim
 
+        # patch embedding
         self.patch_proj = nn.Linear(patch_dim, emb_dim)
-        if pos_emb != None:
-            self.pos_emb = nn.Parameter(pos_emb)
-        else:
-            self.pos_emb = torch.zeros(num_patches,emb_dim)
-        nn.init.trunc_normal_(self.pos_emb, std=0.02)
-        if rel_bias!= None:
-            self.rel_bias = nn.Parameter(rel_bias)
-        else:
-            self.rel_bias = torch.zeros(num_patches,num_patches)
-        nn.init.trunc_normal_(self.rel_bias, std=0.02)
 
-        ffn_dim = ffn_dim if ffn_dim is not None else emb_dim * 4
+        # positional encoding
+        self.use_pos_emb = use_pos_emb
+        if use_pos_emb:
+            if pos_emb_init is not None:
+                # user supplied values
+                assert pos_emb_init.shape == (num_patches, emb_dim)
+                pe = pos_emb_init
+            else:
+                # zero init
+                pe = torch.zeros(num_patches, emb_dim)
+            # always wrap in Parameter so .to(device) will move it
+            self.pos_emb = nn.Parameter(pe)
+        else:
+            # no parameter at all
+            self.register_buffer('pos_emb', torch.zeros(1))  # dummy so attribute exists
+            # but will ignore it in forward
+
+        # relative bias
+        self.use_rel_bias = use_rel_bias
+        if use_rel_bias:
+            if rel_bias_init is not None:
+                assert rel_bias_init.shape == (num_patches, num_patches)
+                rb = rel_bias_init
+            else:
+                rb = torch.zeros(num_patches, num_patches)
+            self.rel_bias = nn.Parameter(rb)
+        else:
+            self.register_buffer('rel_bias', torch.zeros(1))
+
+        # encoder layers
+        ffn_dim = ffn_dim or emb_dim * 4
         self.encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(emb_dim, num_heads, ffn_dim)
             for _ in range(num_layers)
         ])
 
+        # final projection
         self.out_proj = nn.Linear(emb_dim, self.vocab_size)
 
     def forward(self, patches, mask_rate):
         B, N, P = patches.shape
+
+        # 1) mask
         mask = torch.rand(B, N, device=patches.device) < mask_rate
         x = patches.clone()
-        x[mask] = self.mask_token  # replace masked positions with the mask token
+        x[mask] = self.mask_token.to(x.device)
 
+        # 2) patch→emb
         x = self.patch_proj(x)
-        
-        x = x + self.pos_emb.unsqueeze(0)
 
-        attn_mask = self.rel_bias[:N, :N]
+        # 3) add pos emb if enabled
+        if self.use_pos_emb:
+            # pos_emb is [N, emb_dim]
+            x = x + self.pos_emb.unsqueeze(0)
 
+        # 4) build attention bias
+        attn_bias = None
+        if self.use_rel_bias:
+            # rel_bias is [N, N]
+            attn_bias = self.rel_bias[:N, :N]
+
+        # 5) transformer
         for layer in self.encoder_layers:
-            x = layer(x, attn_mask=attn_mask)
+            x = layer(x, attn_mask=attn_bias)
 
+        # 6) to logits
         logits = self.out_proj(x)
         return logits, mask
 
