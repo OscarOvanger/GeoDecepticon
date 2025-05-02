@@ -7,8 +7,7 @@ from ViT_sampling_MLA import *
 import wandb  # make sure wandb is installed: pip install wandb
 def run_training(training_data, nr_epochs, batch_size, mask_rate, 
                  final_mask_rate, mask_schedule, patch_size, num_heads, 
-                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap,
-                MLA = True):
+                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap, pos_emb=None,rel_bias=None):
     """
     training_data: numpy array or tensor of shape [N, H, W] (binary images)
     nr_epochs: number of epochs for training
@@ -155,21 +154,15 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
         # ---- Every 10 epochs, perform conditional generation and log to wandb ----
         if (epoch+1) % 50 == 0:
             # Sample conditions for generation.
-            if MLA:
-                condition_indices = np.array([1726-640,3797-640,4211-640,4543-640,3953-640,3347-640,1897-640,2015-640,4424-640,1942-640,2108-640,4350-640,1019-640,4068-640,2911-640])
-                condition_values = np.array([0,1,0,1,1,1,0,1,0,1,0,1,1,1,0])
-                condition_indices_x = (condition_indices_new // 80) - 8
-                condition_indices_y = (condition_indices_new % 80) - 8
-                generated_img, log_likelihood_sum = generate_image_mla(model, patch_size, W_img, condition_indices, condition_values)
-            else:
-                condition_indices = np.array([876,3825,2122,2892,1556,2683,3667,1767,483,2351,
-                                    2000,3312,2953,289,2373,2720,872,2713,1206,1341,
-                                    3541,2226,3423,1904,2882,2540,1497,2524,264,1441])
-                condition_values = np.array([0,1,1,1,0,0,1,0,0,1,0,0,0,1,0,1,0,0,1,0,
-                                              1,1,1,0,1,0,1,1,0,1])
-                condition_indices_x = condition_indices // W_img
-                condition_indices_y = condition_indices % W_img
-                generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices, condition_values) 
+            condition_indices = np.array([1726,3797,4211,4543,3953,3347,1897,2015,4424,1942,2108,4350,1019,4068,2911])
+            condition_values = np.array([0,1,0,1,1,1,0,1,0,1,0,1,1,1,0])
+            condition_indices_x = (condition_indices_new // 80) - 8
+            condition_indices_y = (condition_indices_new % 80) - 8
+            flattened_condition_indices = np.zeros(len(condition_indices))
+            for i in range(len(condition_indices)):
+                flattened_condition_indices[i] = condition_indices_x[i] * 64 + condition_indices_y[i]
+            flattened_condition_indices = flattened_condition_indices.astype(int)
+            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices=flattened_condition_indices, condition_values=condition_values)
             # Create a figure for the generated image.
             fig_gen, ax_gen = plt.subplots(figsize=(12,12))
             # Convert conditions to grid coordinates for plotting.
