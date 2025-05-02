@@ -95,7 +95,7 @@ class TransformerEncoderBlock(nn.Module):
 
 class StackedContextViT(nn.Module):
     def __init__(self, vocab, mask_token, patch_dim, num_patches, emb_dim=128, num_heads=1,
-                 num_layers=1, ffn_dim=None):
+                 num_layers=1, ffn_dim=None,pos_emb=None,rel_bias=None):
         super().__init__()
         self.vocab = vocab
         self.vocab_size = vocab.size(0)
@@ -105,10 +105,15 @@ class StackedContextViT(nn.Module):
         self.num_patches = num_patches
 
         self.patch_proj = nn.Linear(patch_dim, emb_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(num_patches, emb_dim))
+        if pos_emb != None:
+            self.pos_emb = nn.Parameter(pos_emb)
+        else:
+            self.pos_emb = torch.zeros(num_patches,emb_dim)
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
-
-        self.rel_bias = nn.Parameter(torch.zeros(num_patches, num_patches))
+        if rel_bias!= None:
+            self.rel_bias = nn.Parameter(rel_bias)
+        else:
+            self.rel_bias = torch.zeros(num_patches,num_patches)
         nn.init.trunc_normal_(self.rel_bias, std=0.02)
 
         ffn_dim = ffn_dim if ffn_dim is not None else emb_dim * 4
@@ -126,6 +131,7 @@ class StackedContextViT(nn.Module):
         x[mask] = self.mask_token  # replace masked positions with the mask token
 
         x = self.patch_proj(x)
+        
         x = x + self.pos_emb.unsqueeze(0)
 
         attn_mask = self.rel_bias[:N, :N]
