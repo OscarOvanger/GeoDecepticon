@@ -18,6 +18,7 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
     mask_schedule: one of 'linear', 'exp', or 'log' that defines the growth of mask_rate.
     patch_size: patch size (square); for your experiment use 2 if desired.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Initialize wandb
     wandb.init(project="ViT_conditional", config={
         "nr_epochs": nr_epochs,
@@ -62,7 +63,6 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
     use_rel_bias=use_rel_bias,
     rel_bias_init=rel_bias    # either None or your [N×N] tensor
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.vocab = model.vocab.to(device)
 
@@ -71,7 +71,7 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
     criterion = nn.CrossEntropyLoss()
 
     #Weight for reconstruction loss
-    alpha = 0.5
+    alpha = 0.01
     
     for epoch in range(nr_epochs):
         # Compute the current masking rate according to the selected schedule.
