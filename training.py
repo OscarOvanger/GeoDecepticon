@@ -1,5 +1,5 @@
 from ViT_sampling import *
-from ViT_sampling_MLA import *
+#from ViT_sampling_MLA import *
 ########################################
 # Training Loop with Progress Bar and Updated Plotting
 ########################################
@@ -7,7 +7,8 @@ from ViT_sampling_MLA import *
 import wandb  # make sure wandb is installed: pip install wandb
 def run_training(training_data, nr_epochs, batch_size, mask_rate, 
                  final_mask_rate, mask_schedule, patch_size, num_heads, 
-                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap, pos_emb=None,rel_bias=None):
+                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap, 
+                 use_pos_emb=True,pos_emb=None,use_rel_bias=True,rel_bias=None):
     """
     training_data: numpy array or tensor of shape [N, H, W] (binary images)
     nr_epochs: number of epochs for training
@@ -47,8 +48,20 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
     print("vocab size:\n", vocab.size(0))
 
     # Create the ViT model.
-    model = StackedContextViT(vocab, mask_token, patch_dim, num_patches,
-                              emb_dim, num_heads, num_layers, ffn_dim)
+    model = StackedContextViT(
+    vocab=vocab.to(device),
+    mask_token=mask_token.to(device),
+    patch_dim=patch_dim,
+    num_patches=num_patches,
+    emb_dim=emb_dim,
+    num_heads=num_heads,
+    num_layers=num_layers,
+    ffn_dim=ffn_dim,
+    use_pos_emb=use_pos_emb,
+    pos_emb_init=pos_emb,     # either None or your [N×emb_dim] tensor
+    use_rel_bias=use_rel_bias,
+    rel_bias_init=rel_bias    # either None or your [N×N] tensor
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.vocab = model.vocab.to(device)
