@@ -104,8 +104,6 @@ class StackedContextViT(nn.Module):
         num_heads=1,
         num_layers=1,
         ffn_dim=None,
-
-        # new args:
         use_pos_emb: bool = True,
         pos_emb_init: torch.Tensor | None = None,   # if provided, must be [N, emb_dim]
         use_rel_bias: bool = True,
@@ -113,6 +111,7 @@ class StackedContextViT(nn.Module):
     ):
         super().__init__()
         self.vocab      = vocab
+        self.mask_token = mask_token
         self.vocab_size = vocab.size(0)
         self.patch_dim  = patch_dim
         self.emb_dim    = emb_dim
