@@ -7,7 +7,7 @@ from ViT_sampling import *
 import wandb  # make sure wandb is installed: pip install wandb
 def run_training(training_data, nr_epochs, batch_size, mask_rate, 
                  final_mask_rate, mask_schedule, patch_size, num_heads, 
-                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap, 
+                 num_layers, ffn_dim, learning_rate, emb_dim, vocab_cap,pretrained=False, 
                  use_pos_emb=True,pos_emb=None,use_rel_bias=True,rel_bias=None):
     """
     training_data: numpy array or tensor of shape [N, H, W] (binary images)
@@ -49,20 +49,23 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
     print("vocab size:\n", vocab.size(0))
 
     # Create the ViT model.
-    model = StackedContextViT(
-    vocab=vocab.to(device),
-    mask_token=mask_token.to(device),
-    patch_dim=patch_dim,
-    num_patches=num_patches,
-    emb_dim=emb_dim,
-    num_heads=num_heads,
-    num_layers=num_layers,
-    ffn_dim=ffn_dim,
-    use_pos_emb=use_pos_emb,
-    pos_emb_init=pos_emb,     # either None or your [N×emb_dim] tensor
-    use_rel_bias=use_rel_bias,
-    rel_bias_init=rel_bias    # either None or your [N×N] tensor
-    )
+    if pretrained != False:
+      model = pretrained
+    else:
+      model = StackedContextViT(
+      vocab=vocab.to(device),
+      mask_token=mask_token.to(device),
+      patch_dim=patch_dim,
+      num_patches=num_patches,
+      emb_dim=emb_dim,
+      num_heads=num_heads,
+      num_layers=num_layers,
+      ffn_dim=ffn_dim,
+      use_pos_emb=use_pos_emb,
+      pos_emb_init=pos_emb,     # either None or your [N×emb_dim] tensor
+      use_rel_bias=use_rel_bias,
+      rel_bias_init=rel_bias    # either None or your [N×N] tensor
+      )
     model.to(device)
     model.vocab = model.vocab.to(device)
 
@@ -81,8 +84,11 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
             current_mask_rate = mask_rate * ((final_mask_rate / mask_rate) ** (epoch / (nr_epochs - 1)))
         elif mask_schedule == "log":
             current_mask_rate = mask_rate + (final_mask_rate - mask_rate) * (math.log(epoch + 1) / math.log(nr_epochs))
+        elif mask_schedule == "cyclic":
+            current_mask_rate = mask_rate + (final_mask_rate - mask_rate) * ((epoch % 99) / 99)
         else:
             current_mask_rate = mask_rate  # fallback to constant rate
+        
 
         model.train()
         total_loss = 0.0
@@ -175,7 +181,7 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
             for i in range(len(condition_indices)):
                 flattened_condition_indices[i] = condition_indices_x[i] * 64 + condition_indices_y[i]
             flattened_condition_indices = flattened_condition_indices.astype(int)
-            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices=flattened_condition_indices, condition_values=condition_values)
+            generated_img, log_likelihood_sum = generate_image(model, patch_size, W_img, condition_indices=flattened_condition_indices, condition_values=condition_values, generation_order="random")
             # Create a figure for the generated image.
             fig_gen, ax_gen = plt.subplots(figsize=(12,12))
             # Convert conditions to grid coordinates for plotting.
