@@ -175,8 +175,8 @@ def run_training(training_data, nr_epochs, batch_size, mask_rate,
             # Sample conditions for generation.
             condition_indices = np.array([1726,3797,4211,4543,3953,3347,1897,2015,4424,1942,2108,4350,1019,4068,2911])
             condition_values = np.array([0,1,0,1,1,1,0,1,0,1,0,1,1,1,0])
-            condition_indices_x = (condition_indices_new // 80) - 8
-            condition_indices_y = (condition_indices_new % 80) - 8
+            condition_indices_x = (condition_indices // 80) - 8
+            condition_indices_y = (condition_indices % 80) - 8
             flattened_condition_indices = np.zeros(len(condition_indices))
             for i in range(len(condition_indices)):
                 flattened_condition_indices[i] = condition_indices_x[i] * 64 + condition_indices_y[i]
