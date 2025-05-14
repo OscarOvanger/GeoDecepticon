@@ -5,6 +5,112 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import math
 from ViT import *
+
+import torch
+import torch.nn.functional as F
+import math
+import numpy as np
+
+def log_likelihood_evaluation_batch(
+    model,
+    batch_images,            # tensor [B, H, W] of binary images
+    patch_size,              # int
+    condition_indices=None,  # list/array of pixel‐indices to condition on
+    condition_values=None,   # list/array of 0/1 values for those pixels
+    generation_order="manhattan"
+):
+    """
+    Returns: tensor of shape [B] giving the total log‐likelihood under the model
+             of each image in the batch, computed by “peeling off” one patch at a
+             time in the specified order, always using the true patch.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    B, H, W = batch_images.shape
+    G = H // patch_size
+    P = G * G
+    D = patch_size * patch_size
+
+    # 1) turn images → onehot patches
+    patches = batch_images.unfold(1,patch_size,patch_size) \
+                          .unfold(2,patch_size,patch_size) \
+                          .contiguous() \
+                          .view(B, P, D)            # [B, P, D]
+
+    # 2) pre‐fill a “generated” buffer with mask_token
+    mask_tok = model.mask_token.detach().to(device)  # [D]
+    gen = mask_tok.unsqueeze(0).unsqueeze(0).expand(B, P, D).clone()  # [B,P,D]
+
+    # 3) build per‐patch constraints if any
+    cond_by_patch = {}
+    if condition_indices is not None and condition_values is not None:
+        cond_idx = np.array(condition_indices)
+        cond_val = np.array(condition_values)
+        # assume same cond for all images
+        for pix, val in zip(cond_idx, cond_val):
+            pr = (pix // W) // patch_size
+            pc = (pix %  W) // patch_size
+            pi = pr*G + pc
+            lr = (pix // W) % patch_size
+            lc = (pix %  W) % patch_size
+            local = lr*patch_size + lc
+            cond_by_patch.setdefault(pi,[]).append((local,int(val)))
+
+    # 4) pick your order of patch‐ids
+    all_ids = list(range(P))
+    observed = sorted(cond_by_patch.keys())
+    unobs = [i for i in all_ids if i not in observed]
+
+    if generation_order=="manhattan" and observed:
+        dist = []
+        for u in unobs:
+            r,c = divmod(u,G)
+            ds = sum(abs(r - (o//G)) + abs(c - (o%G)) for o in observed)
+            dist.append((u,ds))
+        dist.sort(key=lambda x:x[1])
+        unobs = [u for u,_ in dist]
+    elif generation_order=="raster":
+        unobs.sort()
+    elif generation_order=="random":
+        np.random.shuffle(unobs)
+    else:
+        raise ValueError(generation_order)
+
+    order = observed + unobs
+
+    # 5) now iterate & accumulate
+    logls = torch.zeros(B,device=device)
+
+    with torch.no_grad():
+        for pi in order:
+            # forward with everything we’ve seen so far
+            logits, _ = model(gen, mask_rate=0.0)    # [B,P,V]
+            lc = logits[:,pi,:]                     # [B, V]
+
+            # if conditioned, ban any vocab that violates the observed pixel(s)
+            if pi in cond_by_patch:
+                mask = torch.ones(model.vocab_size,device=device,dtype=torch.bool)
+                for local,val in cond_by_patch[pi]:
+                    mask &= (model.vocab[:,local].long()==val)
+                lc[:,~mask] = -1e9
+
+            # get true patch‐ID for each image by nearest‐neighbor
+            true_patch = patches[:,pi,:]            # [B,D]
+            # compute distances once:
+            #    (B,1,D) vs (1,V,D) → (B,V)
+            d = torch.cdist(true_patch, model.vocab.to(device))  # [B,V]
+            tgt = d.argmin(dim=1)                  # [B]
+
+            # add log‐prob of the correct vocab token
+            p = F.log_softmax(lc,dim=-1)          # [B,V]
+            logls += p[torch.arange(B,device=device), tgt]
+
+            # “reveal” the true patch
+            gen[:,pi,:] = true_patch
+
+    return logls.cpu()  # tensor of length B
+    
 ########################################
 # Generates conditional images
 ########################################
