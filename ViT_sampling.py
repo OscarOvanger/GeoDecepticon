@@ -12,104 +12,113 @@ import math
 import numpy as np
 
 def log_likelihood_evaluation_batch(
-    model,
-    batch_images,            # tensor [B, H, W] of binary images
-    patch_size,              # int
-    condition_indices=None,  # list/array of pixel‐indices to condition on
-    condition_values=None,   # list/array of 0/1 values for those pixels
-    generation_order="manhattan"
-):
+    model: nn.Module,
+    batch_images: torch.Tensor,         # [B, H, W]
+    patch_size: int,
+    condition_indices: np.ndarray = None,
+    condition_values: np.ndarray = None,
+    generation_order: str = "manhattan"
+) -> torch.Tensor:
     """
-    Returns: tensor of shape [B] giving the total log‐likelihood under the model
-             of each image in the batch, computed by “peeling off” one patch at a
-             time in the specified order, always using the true patch.
+    For each image in the batch, compute the log‐likelihood under the ViT 
+    by “revealing” patches one by one (in the chosen order) and accumulating
+    log p(patch_i | previously revealed patches).
+
+    Returns:
+        log_likes: Tensor of shape [B], the total log‐likelihood of each image.
     """
     model.eval()
     device = next(model.parameters()).device
 
     B, H, W = batch_images.shape
     G = H // patch_size
-    P = G * G
-    D = patch_size * patch_size
+    N = G * G
+    P = patch_size * patch_size
 
-    # 1) turn images → onehot patches
-    patches = batch_images.unfold(1,patch_size,patch_size) \
-                          .unfold(2,patch_size,patch_size) \
-                          .contiguous() \
-                          .view(B, P, D)            # [B, P, D]
+    # 1) Extract all true patches from batch_images
+    patches = BinaryImageDataset.batch_to_patches(batch_images, patch_size)  # [B, N, P]
 
-    # 2) pre‐fill a “generated” buffer with mask_token
-    mask_tok = model.mask_token.detach().to(device)  # [D]
-    gen = mask_tok.unsqueeze(0).unsqueeze(0).expand(B, P, D).clone()  # [B,P,D]
+    # 2) We'll fill in "generated" patches one by one:
+    #    start with mask‐token everywhere
+    mask_tok = model.mask_token.detach().to(device)                          # [P]
+    gen = mask_tok.unsqueeze(0).unsqueeze(0).expand(B, N, P).clone()          # [B,N,P]
 
-    # 3) build per‐patch constraints if any
+    # 3) Prepare conditioning dict (same as generation code)
     cond_by_patch = {}
+    observed = []
     if condition_indices is not None and condition_values is not None:
-        cond_idx = np.array(condition_indices)
-        cond_val = np.array(condition_values)
-        # assume same cond for all images
-        for pix, val in zip(cond_idx, cond_val):
-            pr = (pix // W) // patch_size
-            pc = (pix %  W) // patch_size
-            pi = pr*G + pc
-            lr = (pix // W) % patch_size
-            lc = (pix %  W) % patch_size
+        condition_indices = np.array(condition_indices)
+        condition_values = np.array(condition_values)
+        if condition_values.ndim == 1:
+            cvals = np.tile(condition_values, (B,1))
+        else:
+            cvals = condition_values
+        for i, vals in enumerate(cvals):
+            # but we assume same indices for all, so only look at first row
+            pass
+        for pix, val in zip(condition_indices, condition_values):
+            r, c = divmod(pix, W)
+            pr, pc = r//patch_size, c//patch_size
+            idx = pr*G + pc
+            lr, lc = r%patch_size, c%patch_size
             local = lr*patch_size + lc
-            cond_by_patch.setdefault(pi,[]).append((local,int(val)))
+            cond_by_patch.setdefault(idx, []).append((local, int(val)))
+        observed = sorted(cond_by_patch.keys())
 
-    # 4) pick your order of patch‐ids
-    all_ids = list(range(P))
-    observed = sorted(cond_by_patch.keys())
-    unobs = [i for i in all_ids if i not in observed]
-
-    if generation_order=="manhattan" and observed:
-        dist = []
-        for u in unobs:
-            r,c = divmod(u,G)
-            ds = sum(abs(r - (o//G)) + abs(c - (o%G)) for o in observed)
-            dist.append((u,ds))
-        dist.sort(key=lambda x:x[1])
-        unobs = [u for u,_ in dist]
-    elif generation_order=="raster":
+    # 4) Build sampling order
+    all_idxs = set(range(N))
+    unobs = list(all_idxs - set(observed))
+    if generation_order == "manhattan":
+        if observed:
+            dist_list = []
+            for p in unobs:
+                pr, pc = divmod(p, G)
+                d = sum(abs(pr - (o//G)) + abs(pc - (o%G)) for o in observed)
+                dist_list.append((p,d))
+            dist_list.sort(key=lambda x: x[1])
+            unobs = [p for p,_ in dist_list]
+        else:
+            unobs.sort()
+    elif generation_order == "raster":
         unobs.sort()
-    elif generation_order=="random":
+    elif generation_order == "random":
         np.random.shuffle(unobs)
     else:
-        raise ValueError(generation_order)
+        raise ValueError(f"Unknown generation_order: {generation_order}")
 
     order = observed + unobs
 
-    # 5) now iterate & accumulate
-    logls = torch.zeros(B,device=device)
-
+    # 5) Now iterate and accumulate
+    log_likes = torch.zeros(B, device=device)
     with torch.no_grad():
-        for pi in order:
-            # forward with everything we’ve seen so far
-            logits, _ = model(gen, mask_rate=0.0)    # [B,P,V]
-            lc = logits[:,pi,:]                     # [B, V]
+        for p_idx in order:
+            # a) forward current gen → logits
+            logits, _ = model(gen, mask_rate=0.0)     # [B,N,V]
+            logits_p = logits[:, p_idx, :]           # [B, V]
 
-            # if conditioned, ban any vocab that violates the observed pixel(s)
-            if pi in cond_by_patch:
-                mask = torch.ones(model.vocab_size,device=device,dtype=torch.bool)
-                for local,val in cond_by_patch[pi]:
-                    mask &= (model.vocab[:,local].long()==val)
-                lc[:,~mask] = -1e9
+            # b) if p_idx is conditioned, mask out invalid vocab entries
+            if p_idx in cond_by_patch:
+                valid = torch.ones(model.vocab_size, dtype=torch.bool, device=device)
+                for local, val in cond_by_patch[p_idx]:
+                    valid &= (model.vocab[:, local] == val)
+                logits_p[:, ~valid] = -1e9
 
-            # get true patch‐ID for each image by nearest‐neighbor
-            true_patch = patches[:,pi,:]            # [B,D]
-            # compute distances once:
-            #    (B,1,D) vs (1,V,D) → (B,V)
-            d = torch.cdist(true_patch, model.vocab.to(device))  # [B,V]
-            tgt = d.argmin(dim=1)                  # [B]
+            # c) compute true‐patch’s vocab index for each image
+            #    by nearest‐neighbor in vocab:
+            true_patch = patches[:, p_idx, :]        # [B,P]
+            #   compute argmin cdist(true_patch[i], vocab) in a vectorized way:
+            #   (or cache a mapping beforehand)
+            dmat = torch.cdist(true_patch, model.vocab)  # [B, V]
+            true_idx = dmat.argmin(dim=1)                # [B]
 
-            # add log‐prob of the correct vocab token
-            p = F.log_softmax(lc,dim=-1)          # [B,V]
-            logls += p[torch.arange(B,device=device), tgt]
+            # d) add log‐prob of the true patch
+            logp = F.log_softmax(logits_p, dim=-1)       # [B, V]
+            log_likes += logp[torch.arange(B,device=device), true_idx]
 
-            # “reveal” the true patch
-            gen[:,pi,:] = true_patch
+            # e) reveal the true patch in gen
+            gen[:, p_idx, :] = model.vocab[true_idx]
 
-    return logls.cpu()  # tensor of length B
+    return log_likes  # [B]
     
 ########################################
 # Generates conditional images
