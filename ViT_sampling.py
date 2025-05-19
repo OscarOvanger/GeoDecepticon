@@ -329,6 +329,20 @@ def generate_images_batch(model, patch_size, image_size, batch_size,device,
             distance_list.append((p, dist_sum))
         distance_list.sort(key=lambda x: x[1])
         unobserved_patch_ids = [p for p, _ in distance_list]
+    elif generation_order == "inverse manhattan" and observed_patch_ids:
+        # new: sum of inverse distances, then descending
+        inv_list = []
+        for p in unobserved_patch_ids:
+            row, col = divmod(p, grid_size)
+            inv_sum = 0.0
+            for op in observed_patch_ids:
+                orow, ocol = divmod(op, grid_size)
+                dist = abs(row - orow) + abs(col - ocol)
+                inv_sum += 1.0 / dist
+            inv_list.append((p, inv_sum))
+        # sort by inverse‐sum descending
+        inv_list.sort(key=lambda x: x[1], reverse=True)
+        unobserved_patch_ids = [p for p, _ in inv_list]
     elif generation_order == "raster":
         unobserved_patch_ids.sort()
     elif generation_order == "random":
