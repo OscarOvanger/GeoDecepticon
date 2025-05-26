@@ -269,7 +269,7 @@ def generate_image(
 
 def generate_images_batch(model, patch_size, image_size, batch_size,device, 
                           condition_indices=None, condition_values=None, 
-                          generation_order="manhattan"):
+                          generation_order="manhattan",temperature=1.0):
     """
     Generate a batch of images (batch_size images) in parallel.
     If condition_indices and condition_values are provided, they apply to all images in the batch.
@@ -374,7 +374,10 @@ def generate_images_batch(model, patch_size, image_size, batch_size,device,
             logits_current[:, ~valid_vocab] = -float('inf')
 
         # Compute probabilities and sample a patch for each image in the batch
-        probs = F.softmax(logits_current, dim=-1)  # [batch_size, vocab_size]
+        #probs = F.softmax(logits_current, dim=-1)  # [batch_size, vocab_size]
+        # apply temperature scaling to generated logits
+        logits_temp = logits_current / temperature
+        probs = F.softmax(logits_temp, dim=-1)     # [batch_size, vocab_size]
         sampled_indices = []
         for i in range(batch_size):
             idx = torch.multinomial(probs[i], num_samples=1).item()
