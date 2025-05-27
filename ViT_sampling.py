@@ -353,9 +353,10 @@ def generate_images_batch(model, patch_size, image_size, batch_size,device,
     sampling_order = observed_patch_ids + unobserved_patch_ids
 
     # Initialize log-likelihood sums for each image in batch
-    log_likelihoods = [0.0] * batch_size
+    log_likelihoods = np.zeros((batch_size,total_patches)) #(batch_size,256)
 
     # Iteratively generate each patch for all images in parallel
+    counter = 0
     for p_idx in sampling_order:
         with torch.no_grad():
             # Forward pass for all images with current known patches
@@ -364,6 +365,7 @@ def generate_images_batch(model, patch_size, image_size, batch_size,device,
         logits_current = logits[:, p_idx, :].clone()
 
         # If this patch is conditioned (observed) and we have constraints:
+        
         if p_idx in conditions_by_patch:
             # We restrict vocabulary choices for all images based on the condition.
             # (Assuming same condition constraint for all images.)
@@ -383,12 +385,16 @@ def generate_images_batch(model, patch_size, image_size, batch_size,device,
             idx = torch.multinomial(probs[i], num_samples=1).item()
             sampled_indices.append(idx)
             # Accumulate log-likelihood for each image
-            log_likelihoods[i] += math.log(probs[i, idx].item() + 1e-10)
+            if counter == 0:
+                log_likelihoods[i,counter] = math.log(probs[i, idx].item() + 1e-10)
+            else:
+                log_likelihoods[i,counter] = math.log(probs[i, idx].item() + 1e-10) + log_likelihoods[i,counter-1]
         sampled_indices = torch.tensor(sampled_indices, device=device)
         # Retrieve the actual patch values for these sampled vocab indices
         sampled_patches = model.vocab[sampled_indices]  # [batch_size, patch_dim]
         # Update the generated patches for all images at position p_idx
         generated_patches[:, p_idx, :] = sampled_patches
+        counter += 1
 
     # All patches filled, reconstruct images
     generated_images = []
